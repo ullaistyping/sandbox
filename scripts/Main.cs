@@ -24,6 +24,8 @@ public partial class Main : Control
 	private const int BrushGlorp    = -3;
 	private const int BrushPin      = -4;
 	private const int BrushHeatView = -5;
+	private const int BrushTurret = -6;
+	private const int BrushMirror = -7;
 
 	// ── Colours ───────────────────────────────────────────────────────────────
 
@@ -63,6 +65,9 @@ public partial class Main : Control
 	private static readonly byte SteamR      = (byte)(0.85f * 255);
 	private static readonly byte SteamG      = (byte)(0.85f * 255);
 	private static readonly byte SteamB      = (byte)(0.88f * 255);
+	private static readonly byte MirrorR     = (byte)(0.82f * 255);
+	private static readonly byte MirrorG     = (byte)(0.88f * 255);
+	private static readonly byte MirrorB     = (byte)(0.96f * 255);
 
 	// ── Fields ────────────────────────────────────────────────────────────────
 
@@ -82,7 +87,7 @@ public partial class Main : Control
 	private Button _btnSand, _btnWater, _btnStone, _btnLava, _btnGas;
 	private Button _btnFood, _btnGlorp, _btnCopper, _btnBattery, _btnWood, _btnErase, _btnForce;
 	private Button _btnTabMaterials, _btnTabSettings, _btnTabAnalysis, _detachBtn;
-	private Button _btnHeatView, _btnPin;
+	private Button _btnHeatView, _btnPin, _btnTurret, _btnMirror;
 	private Control _materialsPage, _settingsPage, _analysisPage;
 	private Label   _heatResultLabel;
 	private HSlider _slider, _speedSlider;
@@ -108,6 +113,10 @@ public partial class Main : Control
 	private RichTextLabel _consoleOutput;
 	private LineEdit      _consoleInput;
 	private bool          _consoleOpen;
+
+	// Turrets
+	private readonly List<LaserTurret> _turrets = new();
+	private Vector2I _mouseSim;
 
 	// Glorps
 	private readonly List<Glorp> _glorps = new();
@@ -164,6 +173,8 @@ public partial class Main : Control
 		_btnWood    = GetNode<Button>(g + "BtnWood");
 		_btnErase   = GetNode<Button>(g + "BtnErase");
 		_btnForce   = GetNode<Button>(g + "BtnForce");
+		_btnTurret = GetNode<Button>(g + "BtnTurret");
+		_btnMirror = GetNode<Button>(g + "BtnMirror");
 
 		_slider      = GetNode<HSlider>("UI/ToolBox/Panel/VBoxContainer/MaterialsPage/SizeSlider");
 		_speedSlider = GetNode<HSlider>("UI/ToolBox/Panel/VBoxContainer/SettingsPage/SpeedSlider");
@@ -194,6 +205,8 @@ public partial class Main : Control
 		_btnWood.Pressed    += () => SetBrush(BrushWood);
 		_btnErase.Pressed   += () => SetBrush(BrushErase);
 		_btnForce.Pressed   += () => SetBrush(BrushForce);
+		_btnTurret.Pressed      += () => SetBrush(BrushTurret);
+		_btnMirror.Pressed += () => SetBrush(BrushMirror);
 		_slider.ValueChanged      += v => _brushSize      = (int)v;
 		_speedSlider.ValueChanged += v => _ticksPerSecond = (int)v;
 
@@ -228,6 +241,8 @@ public partial class Main : Control
 		_overlay.QueueRedraw();
 
 		Vector2 mouse = GetViewport().GetMousePosition();
+		_mouseSim = ScreenToSim(mouse);
+		UpdateTurrets();
 
 		if (!_detached)
 		{
@@ -270,7 +285,10 @@ public partial class Main : Control
 			if (_brush == BrushPin)
 				ApplyPin(simPos, false); // RMB always unpins
 			else
+			{
 				StampCircle(simPos.X, simPos.Y, (int)Simulation.Cell.Air);
+				EraseTurretsInRadius(simPos.X, simPos.Y, _brushSize);
+			}
 		}
 	}
 
@@ -341,6 +359,10 @@ public partial class Main : Control
 					else if (_brush == BrushGlorp && !overUI)
 					{
 						SpawnGlorp(ScreenToSim(mouse).X, ScreenToSim(mouse).Y);
+					}
+					else if (_brush == BrushTurret && !overUI)
+					{
+						PlaceTurret(ScreenToSim(mouse));
 					}
 				}
 				else if (mb.ButtonIndex == MouseButton.Right)
@@ -451,6 +473,7 @@ public partial class Main : Control
 			b = (byte)(CopperColdB + (CopperHotB - CopperColdB) * t);
 		}
 		else if (cell == (byte)Simulation.Cell.Battery) { r = BatteryR; g = BatteryG; b = BatteryB; }
+		else if (cell == (byte)Simulation.Cell.Mirror)  { r = MirrorR;  g = MirrorG;  b = MirrorB;  }
 		else if (cell == (byte)Simulation.Cell.Wood)
 		{
 			// subtle grain variation per-cell using position hash
@@ -528,6 +551,16 @@ public partial class Main : Control
 			c.DrawRect(selRect, new Color(1, 1, 1, 0.12f));           // subtle white fill
 			c.DrawRect(selRect, new Color(1, 1, 1, 0.95f), false, 2f); // bright white outline
 		}
+		// Mirror cells — draw × to indicate reflective surface (orientation is turret-relative, not stored)
+		for (int my = 0; my < SimH; my++)
+		for (int mx = 0; mx < SimW; mx++)
+		{
+			if (_sim.Grid[my * SimW + mx] != (byte)Simulation.Cell.Mirror) continue;
+			float sx = mx * Scale, sy = my * Scale;
+			c.DrawLine(new Vector2(sx,         sy        ), new Vector2(sx + Scale, sy + Scale), new Color(1f, 1f, 1f, 0.80f), 1f);
+			c.DrawLine(new Vector2(sx + Scale, sy        ), new Vector2(sx,         sy + Scale), new Color(1f, 1f, 1f, 0.80f), 1f);
+		}
+		DrawTurrets(c);
 	}
 
 	// ── UI state ──────────────────────────────────────────────────────────────
@@ -552,6 +585,8 @@ public partial class Main : Control
 		_btnForce.Modulate   = b == BrushForce   ? Colors.Yellow : Colors.White;
 		_btnHeatView.Modulate = b == BrushHeatView ? Colors.Yellow : Colors.White;
 		_btnPin.Modulate      = b == BrushPin      ? Colors.Yellow : Colors.White;
+		_btnTurret.Modulate = b == BrushTurret ? Colors.Yellow : Colors.White;
+		_btnMirror.Modulate = b == BrushMirror ? Colors.Yellow : Colors.White;
 	}
 
 	private void SetActiveTab(int tab)
@@ -628,8 +663,9 @@ public partial class Main : Control
 			case BrushCopper:  StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Copper);  break;
 			case BrushBattery: StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Battery); break;
 			case BrushWood:    StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Wood);    break;
-			case BrushErase:   StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Air);     break;
-			case BrushForce:   _sim.ApplyForce(sp.X, sp.Y, _brushSize * 3, 6);        break;
+			case BrushErase:       StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Air); EraseTurretsInRadius(sp.X, sp.Y, _brushSize); break;
+			case BrushForce:       _sim.ApplyForce(sp.X, sp.Y, _brushSize * 3, 6);        break;
+			case BrushMirror: StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Mirror); break;
 		}
 	}
 
@@ -705,6 +741,7 @@ public partial class Main : Control
 				_pinnedSet.Clear();
 				foreach (var gl in _glorps) gl.QueueFree();
 				_glorps.Clear(); _selectedGlorp = null;
+				_turrets.Clear();
 				ConsoleLog("[color=cyan]Grid cleared.[/color]");
 				break;
 
@@ -725,4 +762,215 @@ public partial class Main : Control
 	}
 
 	private void ConsoleLog(string bbcode) => _consoleOutput.AppendText("\n" + bbcode);
+
+	// ── Laser Turrets ──────────────────────────────────────────────────────────
+
+	private void PlaceTurret(Vector2I origin)
+	{
+		for (int dy = 0; dy < LaserTurret.BaseH; dy++)
+		for (int dx = -LaserTurret.BaseHalfW; dx <= LaserTurret.BaseHalfW; dx++)
+			if (!_sim.InBounds(origin.X + dx, origin.Y + dy)) return;
+		_turrets.Add(LaserTurret.Place(_sim, origin));
+	}
+
+	private void UpdateTurrets()
+	{
+		foreach (var t in _turrets)
+		{
+			t.Powered = t.CheckPowered(_sim);
+			t.UpdateAngle(_mouseSim);
+		}
+	}
+
+	private void EraseTurretsInRadius(int cx, int cy, int radius)
+	{
+		for (int i = _turrets.Count - 1; i >= 0; i--)
+		{
+			var t = _turrets[i];
+			bool hit = false;
+			for (int dy = -radius; dy <= radius && !hit; dy++)
+			for (int dx = -radius; dx <= radius && !hit; dx++)
+			{
+				if (dx * dx + dy * dy > radius * radius) continue;
+				if (t.ContainsIndex((cy + dy) * SimW + (cx + dx))) hit = true;
+			}
+			if (!hit) continue;
+			t.Remove(_sim);
+			_turrets.RemoveAt(i);
+		}
+	}
+
+	private void DrawTurrets(OverlayCanvas c)
+	{
+		const float barrelPx = 4 * Scale;
+		var barrelCol = new Color(0.12f, 0.12f, 0.12f);
+
+		foreach (var t in _turrets)
+		{
+			var pivotScr = new Vector2(t.Origin.X * Scale + Scale * 0.5f,
+									   t.Origin.Y * Scale + Scale * 0.5f);
+			var dir     = new Vector2(MathF.Cos(t.Angle), MathF.Sin(t.Angle));
+			var tipScr  = pivotScr + dir * barrelPx;
+			c.DrawLine(pivotScr, tipScr, barrelCol, 3f);
+
+			if (!t.Powered) continue;
+
+			var startSim  = new Vector2(t.Origin.X + dir.X * 4.5f,
+										t.Origin.Y + dir.Y * 4.5f);
+			var waypoints = CastLaserRay(startSim, dir, 300f, new Vector2(t.Origin.X, t.Origin.Y));
+			Vector2 prevScr  = tipScr;
+			float   segPower = 1.0f;
+			for (int w = 1; w < waypoints.Count; w++)
+			{
+				var   segEnd     = new Vector2(waypoints[w].X * Scale, waypoints[w].Y * Scale);
+				bool  postBounce = w > 1;
+				int   steps      = Math.Max(1, (int)((segEnd - prevScr).Length() / 8f));
+				for (int s = 0; s < steps; s++)
+				{
+					float frac = (s + 0.5f) / steps;
+					float a    = postBounce ? segPower * (1f - frac) : segPower;
+					var   p0   = prevScr.Lerp(segEnd, (float)s       / steps);
+					var   p1   = prevScr.Lerp(segEnd, (float)(s + 1) / steps);
+					c.DrawLine(p0, p1, new Color(1f, 0.2f,  0f,    0.20f * a), 6f);
+					c.DrawLine(p0, p1, new Color(1f, 0.45f, 0.1f,  0.85f * a), 2.5f);
+					c.DrawLine(p0, p1, new Color(1f, 0.9f,  0.85f, 0.95f * a), 1f);
+				}
+				segPower *= 0.4f;
+				prevScr   = segEnd;
+			}
+		}
+	}
+
+	private List<Vector2> CastLaserRay(Vector2 startSim, Vector2 dir, float maxRange, Vector2 turretOrigin)
+	{
+		const int MaxBounces = 6;
+		var waypoints = new List<Vector2> { startSim };
+		Vector2 pos    = startSim;
+		Vector2 curDir = dir;
+		float remaining = maxRange;
+
+		for (int bounce = 0; bounce <= MaxBounces; bounce++)
+		{
+			bool bounced = false;
+			float dist;
+			for (dist = 0.5f; dist < remaining; dist += 0.5f)
+			{
+				Vector2 p  = pos + curDir * dist;
+				int gx = (int)p.X, gy = (int)p.Y;
+				if (!_sim.InBounds(gx, gy)) { waypoints.Add(p); return waypoints; }
+				int idx   = gy * SimW + gx;
+				byte cell = _sim.Grid[idx];
+				if (cell == (byte)Simulation.Cell.Air   ||
+					cell == (byte)Simulation.Cell.Gas   ||
+					cell == (byte)Simulation.Cell.Steam) continue;
+				if (cell == (byte)Simulation.Cell.Mirror)
+				{
+					waypoints.Add(p);
+					remaining -= dist;
+					pos = p;
+					// Quadrant relative to firing turret determines orientation:
+					// (gx > tx) != (gy > ty) → '\' : (dy, dx)
+					// (gx > tx) == (gy > ty) → '/' : (-dy,-dx)
+					bool isBackslash = (gx > turretOrigin.X) != (gy > turretOrigin.Y);
+					var reflected = isBackslash
+						? new Vector2( curDir.Y,  curDir.X)
+						: new Vector2(-curDir.Y, -curDir.X);
+					// Degenerate: beam parallel to mirror surface — flip to the other formula
+					if (reflected.X * curDir.X + reflected.Y * curDir.Y > 0.99f)
+						reflected = isBackslash
+							? new Vector2(-curDir.Y, -curDir.X)
+							: new Vector2( curDir.Y,  curDir.X);
+					curDir = reflected;
+					bounced = true;
+					break;
+				}
+				if (cell == (byte)Simulation.Cell.Sand  ||
+					cell == (byte)Simulation.Cell.Water ||
+					cell == (byte)Simulation.Cell.Food  ||
+					cell == (byte)Simulation.Cell.Lava)
+				{
+					if (_rng.NextSingle() < 0.25f)
+						_sim.SetCell(gx, gy, (int)Simulation.Cell.Air);
+				}
+				waypoints.Add(p);
+				return waypoints;
+			}
+			if (!bounced) { waypoints.Add(pos + curDir * remaining); return waypoints; }
+		}
+		waypoints.Add(pos + curDir * Math.Max(0, remaining));
+		return waypoints;
+	}
+
+	// ── LaserTurret ────────────────────────────────────────────────────────────
+
+	private sealed class LaserTurret
+	{
+		public const int BaseHalfW = 2;
+		public const int BaseH     = 3;
+
+		public Vector2I           Origin;
+		public float              Angle;
+		public bool               Powered;
+		public readonly List<int> OccupiedIndices = new();
+
+		public static LaserTurret Place(Simulation sim, Vector2I origin)
+		{
+			var t = new LaserTurret { Origin = origin };
+			for (int dy = 0; dy < BaseH; dy++)
+			for (int dx = -BaseHalfW; dx <= BaseHalfW; dx++)
+			{
+				int gx = origin.X + dx, gy = origin.Y + dy;
+				if (!sim.InBounds(gx, gy)) continue;
+				int idx = gy * Simulation.SimW + gx;
+				sim.Grid[idx]   = (byte)(dy == 0 && dx == 0
+					? Simulation.Cell.Battery
+					: Simulation.Cell.Stone);
+				sim.Flow[idx]   = 0;
+				sim.Pinned[idx] = 1;
+				t.OccupiedIndices.Add(idx);
+			}
+			// Copper terminals on both sides of the middle row — power input ports
+			int termRow = origin.Y + 1;
+			foreach (int termX in new[] { origin.X - BaseHalfW - 1, origin.X + BaseHalfW + 1 })
+			{
+				if (!sim.InBounds(termX, termRow)) continue;
+				int idx = termRow * Simulation.SimW + termX;
+				sim.Grid[idx]   = (byte)Simulation.Cell.Copper;
+				sim.Flow[idx]   = 0;
+				sim.Pinned[idx] = 1;
+				t.OccupiedIndices.Add(idx);
+			}
+			return t;
+		}
+
+		public bool CheckPowered(Simulation sim)
+		{
+			int row    = Origin.Y + 1;
+			int leftX  = Origin.X - BaseHalfW - 1;
+			int rightX = Origin.X + BaseHalfW + 1;
+			return (sim.InBounds(leftX,  row) && sim.Electric[row * Simulation.SimW + leftX]  != 0)
+				|| (sim.InBounds(rightX, row) && sim.Electric[row * Simulation.SimW + rightX] != 0);
+		}
+
+		public void UpdateAngle(Vector2I mouseSimPos)
+		{
+			float dx = mouseSimPos.X - Origin.X;
+			float dy = mouseSimPos.Y - Origin.Y;
+			if (dx * dx + dy * dy > 0.01f)
+				Angle = MathF.Atan2(dy, dx);
+		}
+
+		public void Remove(Simulation sim)
+		{
+			foreach (int idx in OccupiedIndices)
+			{
+				sim.Grid[idx]   = (byte)Simulation.Cell.Air;
+				sim.Pinned[idx] = 0;
+				sim.Flow[idx]   = 0;
+			}
+			OccupiedIndices.Clear();
+		}
+
+		public bool ContainsIndex(int idx) => OccupiedIndices.Contains(idx);
+	}
 }

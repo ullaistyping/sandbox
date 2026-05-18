@@ -10,7 +10,7 @@ public partial class Simulation : RefCounted
 	public enum Cell : byte
 	{
 		Air = 0, Sand = 1, Water = 2, Stone = 3, Lava = 4,
-		Gas = 5, Food = 6, Copper = 7, Steam = 8, Battery = 9, Wood = 10
+		Gas = 5, Food = 6, Copper = 7, Steam = 8, Battery = 9, Wood = 10, Mirror = 11
 	}
 
 	public byte[]  Grid;
@@ -126,6 +126,7 @@ public partial class Simulation : RefCounted
 			if (g == (byte)Cell.Copper)  { VelX[i] = 0; VelY[i] = 0; continue; }
 			if (g == (byte)Cell.Battery) { VelX[i] = 0; VelY[i] = 0; continue; }
 			if (g == (byte)Cell.Wood)    { VelX[i] = 0; VelY[i] = 0; continue; }
+			if (g == (byte)Cell.Mirror)  { VelX[i] = 0; VelY[i] = 0; continue; }
 			if (Pinned[i] != 0)          { VelX[i] = 0; VelY[i] = 0; continue; }
 
 			float vx = VelX[i], vy = VelY[i];

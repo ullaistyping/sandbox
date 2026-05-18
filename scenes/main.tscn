@@ -176,6 +176,16 @@ layout_mode = 2
 size_flags_horizontal = 3
 text = "Force"
 
+[node name="BtnTurret" type="Button" parent="UI/ToolBox/Panel/VBoxContainer/MaterialsPage/ButtonGrid"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Turret"
+
+[node name="BtnMirror" type="Button" parent="UI/ToolBox/Panel/VBoxContainer/MaterialsPage/ButtonGrid"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Mirror"
+
 [node name="SizeLabel" type="Label" parent="UI/ToolBox/Panel/VBoxContainer/MaterialsPage"]
 layout_mode = 2
 text = "Brush Size"
