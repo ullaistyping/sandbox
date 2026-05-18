@@ -405,6 +405,9 @@ public partial class Main : Control
 		const float Restitution = 0.2f;
 		const float FricVelX    = 0.85f;
 		const float FricAngVel  = 0.88f;
+		const int   SleepFrames = 45;    // 1.5 s at 30 TPS
+		const float SleepVel    = 0.05f;
+		const float SleepAng    = 0.001f;
 
 		for (int bi = _bodies.Count - 1; bi >= 0; bi--)
 		{
@@ -432,12 +435,50 @@ public partial class Main : Control
 				continue;
 			}
 
-			// ─ Gravity (suppressed when resting on a surface) ─
-			bool groundedPre = IsGrounded(body);
+			// ─ Wake sleeping bodies only when support is lost or fluid arrives ─
+			if (body.Sleeping)
+			{
+				if (!IsGrounded(body) || HasAdjacentFluid(body))
+				{ body.Sleeping = false; body.SleepTimer = 0; }
+				else continue;
+			}
+
+			// ─ Support analysis: centroid + span of cells that have solid below ─
+			bool  groundedPre  = IsGrounded(body);
+			float supportCentX = 0f;
+			float supportMinX  = float.MaxValue;
+			float supportMaxX  = float.MinValue;
+			int   supportCount = 0;
+			if (groundedPre)
+			{
+				foreach (var (cx, cy) in body.GridCells)
+				{
+					if (body.GridCells.Contains((cx, cy + 1))) continue; // not a bottom-edge cell
+					if (!_sim.InBounds(cx, cy + 1)) continue;
+					byte below = _sim.Grid[(cy + 1) * SimW + cx];
+					if (below == (byte)Simulation.Cell.Air   || below == (byte)Simulation.Cell.Steam ||
+						below == (byte)Simulation.Cell.Gas   || below == (byte)Simulation.Cell.Water) continue;
+					supportCentX += cx;
+					if (cx < supportMinX) supportMinX = cx;
+					if (cx > supportMaxX) supportMaxX = cx;
+					supportCount++;
+				}
+				if (supportCount > 0) supportCentX /= supportCount;
+			}
+
+			// ─ Gravity + tipping torque ─
 			if (!groundedPre || body.VelY < 0f)
 				body.VelY = Math.Clamp(body.VelY + Gravity, -MaxRise, MaxFall);
 			else
+			{
 				body.VelY = 0f;
+				if (supportCount > 0)
+				{
+					// Lever arm from support centroid to CoM drives tipping
+					float lever = body.Position.X - supportCentX;
+					body.AngVel += Gravity * lever / body.Inertia;
+				}
+			}
 
 			// ─ Fluid forces (steam, water, gas acting on exposed faces) ─
 			ApplyFluidForces(body);
@@ -517,6 +558,24 @@ public partial class Main : Control
 				body.VelX   *= FricVelX;
 				body.AngVel *= FricAngVel;
 				if (MathF.Abs(body.VelX) < 0.001f) body.VelX = 0f;
+			}
+
+			// ─ Sleep: only when CoM is within the support polygon ─
+			bool comInSupport = supportCount > 0 &&
+								body.Position.X >= supportMinX &&
+								body.Position.X <= supportMaxX + 1f;
+			if (groundedPre && comInSupport &&
+				MathF.Abs(body.VelX)   < SleepVel &&
+				MathF.Abs(body.VelY)   < SleepVel &&
+				MathF.Abs(body.AngVel) < SleepAng)
+				body.SleepTimer++;
+			else
+				body.SleepTimer = 0;
+
+			if (body.SleepTimer >= SleepFrames)
+			{
+				body.Sleeping = true;
+				body.VelX = body.VelY = body.AngVel = body.SubX = body.SubY = 0f;
 			}
 		}
 	}
@@ -709,6 +768,19 @@ public partial class Main : Control
 		var proj    = ProjectCells(body.LocalCells, body.Position.X, body.Position.Y + 1f, body.Angle);
 		var blocked = GetBlockedCells(body.GridCells, proj, out _);
 		return blocked.Count > 0;
+	}
+
+	private bool HasAdjacentFluid(RigidBody body)
+	{
+		foreach (var (cx, cy) in body.GridCells)
+		foreach (var (dx, dy) in FaceDirections)
+		{
+			int nx = cx + dx, ny = cy + dy;
+			if (!_sim.InBounds(nx, ny)) continue;
+			if (body.GridCells.Contains((nx, ny))) continue;
+			if (FluidForce(_sim.Grid[ny * SimW + nx]) > 0f) return true;
+		}
+		return false;
 	}
 
 
