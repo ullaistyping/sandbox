@@ -123,6 +123,14 @@ public partial class Main : Control
 	private readonly HashSet<int> _pinnedSet = new(); // indices into Grid
 	private bool _pinSetMode; // true = pin, false = unpin on this drag
 
+	// Rigid bodies
+	private readonly List<RigidBody>                  _bodies     = new();
+	private readonly Dictionary<(int,int), RigidBody> _cellToBody = new();
+	private readonly HashSet<(int x, int y)>          _woodPreview = new();
+	private bool _placingWood;
+
+	private static readonly (int dx, int dy)[] FaceDirections = { (0,-1),(0,1),(-1,0),(1,0) };
+
 	// ── Ready ─────────────────────────────────────────────────────────────────
 
 	public override void _Ready()
@@ -222,6 +230,7 @@ public partial class Main : Control
 		while (_tickAccum >= interval)
 		{
 			_sim.Update();
+			UpdateRigidBodies();
 			_tickAccum -= interval;
 		}
 		Render();
@@ -251,6 +260,9 @@ public partial class Main : Control
 			var simPos = ScreenToSim(mouse);
 			switch (_brush)
 			{
+				case BrushWood when _placingWood:
+					StampWoodPreview(ScreenToSim(mouse));
+					break;
 				case BrushHeatView when _selectingHeat:
 					_heatEnd = simPos;
 					ComputeHeatResult();
@@ -324,7 +336,12 @@ public partial class Main : Control
 			{
 				if (mb.ButtonIndex == MouseButton.Left)
 				{
-					if (_brush == BrushHeatView && !overUI)
+					if (_brush == BrushWood && !overUI)
+					{
+						_placingWood = true;
+						StampWoodPreview(ScreenToSim(mouse));
+					}
+					else if (_brush == BrushHeatView && !overUI)
 					{
 						_selectingHeat  = true;
 						_hasHeatResult  = false;
@@ -359,13 +376,418 @@ public partial class Main : Control
 			{
 				if (mb.ButtonIndex == MouseButton.Left)
 				{
-					if (_brush == BrushHeatView && _selectingHeat)
+					if (_brush == BrushWood && _placingWood)
+					{
+						_placingWood = false;
+						PlaceWood();
+					}
+					else if (_brush == BrushHeatView && _selectingHeat)
 					{
 						_selectingHeat = false;
 						_hasHeatResult = true;
 					}
 				}
 			}
+		}
+	}
+
+	// ── Rigid body physics ────────────────────────────────────────────────────
+
+	private void UpdateRigidBodies()
+	{
+		const float Gravity     = 0.35f;
+		const float MaxFall     = 8f;
+		const float MaxRise     = 3f;
+		const float MaxAngVel   = 0.06f;
+		const float Restitution = 0.2f;
+		const float FricVelX    = 0.85f;
+		const float FricAngVel  = 0.88f;
+		const int   SleepFrames = 10;
+		const float SleepVel    = 0.05f;
+		const float SleepAng    = 0.001f;
+
+		for (int bi = _bodies.Count - 1; bi >= 0; bi--)
+		{
+			var body = _bodies[bi];
+
+			// Remove if all wood cells have been overwritten (e.g. by explosion)
+			bool alive = false;
+			foreach (var (cx, cy) in body.GridCells)
+				if (_sim.InBounds(cx, cy) && _sim.Grid[cy * SimW + cx] == (byte)Simulation.Cell.Wood)
+				{ alive = true; break; }
+			if (!alive)
+			{
+				foreach (var c in body.GridCells) _cellToBody.Remove(c);
+				_bodies.RemoveAt(bi);
+				continue;
+			}
+
+			// Freeze if any cell is pinned
+			bool pinned = false;
+			foreach (var (cx, cy) in body.GridCells)
+				if (_sim.InBounds(cx, cy) && _sim.Pinned[cy * SimW + cx] != 0) { pinned = true; break; }
+			if (pinned)
+			{
+				body.VelX = body.VelY = body.AngVel = body.SubX = body.SubY = 0;
+				body.Sleeping = false; body.SleepTimer = 0;
+				continue;
+			}
+
+			// Skip sleeping bodies unless something wakes them
+			if (body.Sleeping)
+			{
+				if (!ShouldWake(body)) continue;
+				body.Sleeping = false;
+				body.SleepTimer = 0;
+			}
+
+			// ─ Gravity (suppressed when resting on a surface) ─
+			bool groundedPre = IsGrounded(body);
+			if (!groundedPre || body.VelY < 0f)
+				body.VelY = Math.Clamp(body.VelY + Gravity, -MaxRise, MaxFall);
+			else
+				body.VelY = 0f;
+
+			// ─ Fluid forces (steam, water, gas acting on exposed faces) ─
+			ApplyFluidForces(body);
+
+			// ─ X translation (sub-pixel stepping) ─
+			body.SubX += body.VelX;
+			int stepsX = (int)MathF.Abs(body.SubX);
+			int  dirX  = Math.Sign(body.SubX);
+			for (int s = 0; s < stepsX; s++)
+			{
+				float nx   = body.Position.X + dirX;
+				var   proj = ProjectCells(body.LocalCells, nx, body.Position.Y, body.Angle);
+				DisplaceWater(body.GridCells, proj);
+				var blocked = GetBlockedCells(body.GridCells, proj, out var otherX);
+				if (blocked.Count == 0)
+				{
+					StampGrid(body, proj);
+					body.Position = new Vector2(nx, body.Position.Y);
+					body.SubX -= dirX;
+				}
+				else
+				{
+					ResolveCollision(body, otherX, blocked, new Vector2(-dirX, 0), Restitution);
+					body.SubX = 0f;
+					break;
+				}
+			}
+			if (MathF.Abs(body.SubX) < 1f && MathF.Abs(body.VelX) < 0.001f) body.SubX = 0f;
+
+			// ─ Y translation (sub-pixel stepping) ─
+			body.SubY += body.VelY;
+			int stepsY = (int)MathF.Abs(body.SubY);
+			int  dirY  = Math.Sign(body.SubY);
+			for (int s = 0; s < stepsY; s++)
+			{
+				float ny   = body.Position.Y + dirY;
+				var   proj = ProjectCells(body.LocalCells, body.Position.X, ny, body.Angle);
+				DisplaceWater(body.GridCells, proj);
+				var blocked = GetBlockedCells(body.GridCells, proj, out var otherY);
+				if (blocked.Count == 0)
+				{
+					StampGrid(body, proj);
+					body.Position = new Vector2(body.Position.X, ny);
+					body.SubY -= dirY;
+				}
+				else
+				{
+					ResolveCollision(body, otherY, blocked, new Vector2(0, -dirY), Restitution);
+					body.SubY = 0f;
+					break;
+				}
+			}
+
+			// ─ Rotation (one delta per tick, capped) ─
+			body.AngVel = Math.Clamp(body.AngVel, -MaxAngVel, MaxAngVel);
+			if (MathF.Abs(body.AngVel) > 0.0005f)
+			{
+				float newAngle = body.Angle + body.AngVel;
+				var   proj     = ProjectCells(body.LocalCells, body.Position.X, body.Position.Y, newAngle);
+				DisplaceWater(body.GridCells, proj);
+				var blocked = GetBlockedCells(body.GridCells, proj, out var otherR);
+				if (blocked.Count == 0)
+				{
+					StampGrid(body, proj);
+					body.Angle = newAngle;
+				}
+				else
+				{
+					var n = ComputeContactNormal(body.Position, blocked);
+					ResolveCollision(body, otherR, blocked, n, Restitution * 0.5f);
+				}
+			}
+
+			// ─ Friction when in contact with a surface ─
+			bool groundedPost = IsGrounded(body);
+			if (groundedPost)
+			{
+				body.VelX   *= FricVelX;
+				body.AngVel *= FricAngVel;
+				if (MathF.Abs(body.VelX) < 0.001f) body.VelX = 0f;
+			}
+
+			// ─ Sleep ─
+			if (groundedPost &&
+				MathF.Abs(body.VelX)   < SleepVel &&
+				MathF.Abs(body.VelY)   < SleepVel &&
+				MathF.Abs(body.AngVel) < SleepAng)
+				body.SleepTimer++;
+			else
+				body.SleepTimer = 0;
+
+			if (body.SleepTimer >= SleepFrames)
+			{
+				body.Sleeping = true;
+				body.VelX = body.VelY = body.AngVel = body.SubX = body.SubY = 0f;
+			}
+		}
+	}
+
+	private static HashSet<(int, int)> ProjectCells(List<Vector2> local, float px, float py, float angle)
+	{
+		var   result = new HashSet<(int, int)>();
+		float cos    = MathF.Cos(angle), sin = MathF.Sin(angle);
+		foreach (var l in local)
+		{
+			int wx = (int)MathF.Round(px + l.X * cos - l.Y * sin);
+			int wy = (int)MathF.Round(py + l.X * sin + l.Y * cos);
+			result.Add((wx, wy));
+		}
+		return result;
+	}
+
+	// Returns cells in `next` that are not passable (blocked). Out param is the owning RigidBody if it's another body.
+	private List<(int, int)> GetBlockedCells(
+		HashSet<(int, int)> current,
+		HashSet<(int, int)> next,
+		out RigidBody otherBody)
+	{
+		var blocked = new List<(int, int)>();
+		otherBody = null;
+		foreach (var (x, y) in next)
+		{
+			if (current.Contains((x, y))) continue;
+			if (!_sim.InBounds(x, y)) { blocked.Add((x, y)); continue; }
+			if (_sim.Pinned[y * SimW + x] != 0) { blocked.Add((x, y)); continue; }
+			byte c = _sim.Grid[y * SimW + x];
+			if (c == (byte)Simulation.Cell.Air   ||
+				c == (byte)Simulation.Cell.Steam  ||
+				c == (byte)Simulation.Cell.Gas    ||
+				c == (byte)Simulation.Cell.Water) continue;
+			if (c == (byte)Simulation.Cell.Wood &&
+				_cellToBody.TryGetValue((x, y), out var owner) && owner != null)
+			{
+				blocked.Add((x, y));
+				if (otherBody == null) otherBody = owner;
+				continue;
+			}
+			blocked.Add((x, y));
+		}
+		return blocked;
+	}
+
+	// Push water cells that `next` would enter into adjacent air cells.
+	private void DisplaceWater(HashSet<(int, int)> current, HashSet<(int, int)> next)
+	{
+		foreach (var (x, y) in next)
+		{
+			if (current.Contains((x, y))) continue;
+			if (!_sim.InBounds(x, y)) continue;
+			if (_sim.Grid[y * SimW + x] == (byte)Simulation.Cell.Water)
+				TryDisplaceWater(x, y);
+		}
+	}
+
+	private bool TryDisplaceWater(int wx, int wy)
+	{
+		ReadOnlySpan<int> dxs = stackalloc int[] { 0, 0, -1, 1 };
+		ReadOnlySpan<int> dys = stackalloc int[] { -1, 1, 0, 0 };
+		for (int k = 0; k < 4; k++)
+		{
+			int nx = wx + dxs[k], ny = wy + dys[k];
+			if (!_sim.InBounds(nx, ny)) continue;
+			if (_sim.Grid[ny * SimW + nx] != (byte)Simulation.Cell.Air) continue;
+			int si = wy * SimW + wx, di = ny * SimW + nx;
+			_sim.Grid[di] = (byte)Simulation.Cell.Water; _sim.Flow[di] = _sim.Flow[si];
+			_sim.Grid[si] = (byte)Simulation.Cell.Air;   _sim.Flow[si] = 0;
+			return true;
+		}
+		return false;
+	}
+
+	private void StampGrid(RigidBody body, HashSet<(int, int)> next)
+	{
+		foreach (var (x, y) in body.GridCells)
+		{
+			if (next.Contains((x, y))) continue;
+			_sim.Grid[y * SimW + x] = (byte)Simulation.Cell.Air;
+			_cellToBody.Remove((x, y));
+		}
+		foreach (var (x, y) in next)
+		{
+			_sim.Grid[y * SimW + x] = (byte)Simulation.Cell.Wood;
+			_cellToBody[(x, y)] = body;
+		}
+		body.GridCells = next;
+	}
+
+	private static void ResolveCollision(
+		RigidBody bodyA,
+		RigidBody bodyB,             // null = static surface
+		List<(int, int)> contactCells,
+		Vector2 n,
+		float e)
+	{
+		// Mean contact point
+		float cx = 0f, cy = 0f;
+		foreach (var (x, y) in contactCells) { cx += x; cy += y; }
+		cx /= contactCells.Count; cy /= contactCells.Count;
+
+		// Offset from CoM to contact point
+		var rA = new Vector2(cx - bodyA.Position.X, cy - bodyA.Position.Y);
+		// Contact velocity on A: v + ω × r  (2D: ω × r = (-ω*r.y, ω*r.x))
+		var velA = new Vector2(bodyA.VelX - bodyA.AngVel * rA.Y,
+							   bodyA.VelY + bodyA.AngVel * rA.X);
+
+		float rACrossN = rA.X * n.Y - rA.Y * n.X;
+		float denom    = 1f / bodyA.Mass + rACrossN * rACrossN / bodyA.Inertia;
+
+		Vector2 velRel;
+		Vector2 rB = default;
+		if (bodyB != null)
+		{
+			rB = new Vector2(cx - bodyB.Position.X, cy - bodyB.Position.Y);
+			var velB = new Vector2(bodyB.VelX - bodyB.AngVel * rB.Y,
+								   bodyB.VelY + bodyB.AngVel * rB.X);
+			velRel = velA - velB;
+			float rBCrossN = rB.X * n.Y - rB.Y * n.X;
+			denom += 1f / bodyB.Mass + rBCrossN * rBCrossN / bodyB.Inertia;
+		}
+		else
+		{
+			velRel = velA;
+		}
+
+		float Vn = velRel.X * n.X + velRel.Y * n.Y;
+		if (Vn >= 0f) return; // already separating
+
+		float j = -(1f + e) * Vn / MathF.Max(denom, 0.0001f);
+
+		bodyA.VelX   += j * n.X / bodyA.Mass;
+		bodyA.VelY   += j * n.Y / bodyA.Mass;
+		bodyA.AngVel += (rA.X * (j * n.Y) - rA.Y * (j * n.X)) / bodyA.Inertia;
+
+		if (bodyB != null)
+		{
+			bodyB.VelX   -= j * n.X / bodyB.Mass;
+			bodyB.VelY   -= j * n.Y / bodyB.Mass;
+			bodyB.AngVel -= (rB.X * (j * n.Y) - rB.Y * (j * n.X)) / bodyB.Inertia;
+			if (bodyB.Sleeping) { bodyB.Sleeping = false; bodyB.SleepTimer = 0; }
+		}
+	}
+
+	// Per exposed face, apply force from adjacent fluid cells (enables steam windmill).
+	// Force direction is AWAY from the fluid cell (inward push on the body).
+	private void ApplyFluidForces(RigidBody body)
+	{
+		foreach (var (cx, cy) in body.GridCells)
+		foreach (var (dx, dy) in FaceDirections)
+		{
+			int nx = cx + dx, ny = cy + dy;
+			if (!_sim.InBounds(nx, ny)) continue;
+			if (body.GridCells.Contains((nx, ny))) continue;
+			float force = FluidForce(_sim.Grid[ny * SimW + nx]);
+			if (force == 0f) continue;
+
+			// Contact point at the face centre; force pushes in -face direction
+			float rx = cx + dx * 0.5f - body.Position.X;
+			float ry = cy + dy * 0.5f - body.Position.Y;
+			float fx = force * -dx, fy = force * -dy;
+
+			body.VelX   += fx / body.Mass;
+			body.VelY   += fy / body.Mass;
+			body.AngVel += (rx * fy - ry * fx) / body.Inertia;
+		}
+	}
+
+	private static float FluidForce(byte cell)
+	{
+		if (cell == (byte)Simulation.Cell.Steam) return 0.08f;
+		if (cell == (byte)Simulation.Cell.Water) return 0.04f;
+		if (cell == (byte)Simulation.Cell.Gas)   return 0.02f;
+		return 0f;
+	}
+
+	// Contact normal pointing from blocked cells toward body CoM.
+	private static Vector2 ComputeContactNormal(Vector2 pos, List<(int, int)> blocked)
+	{
+		float nx = 0f, ny = 0f;
+		foreach (var (x, y) in blocked) { nx += pos.X - x; ny += pos.Y - y; }
+		float len = MathF.Sqrt(nx * nx + ny * ny);
+		return len > 0.001f ? new Vector2(nx / len, ny / len) : new Vector2(0f, -1f);
+	}
+
+	private bool IsGrounded(RigidBody body)
+	{
+		var proj    = ProjectCells(body.LocalCells, body.Position.X, body.Position.Y + 1f, body.Angle);
+		var blocked = GetBlockedCells(body.GridCells, proj, out _);
+		return blocked.Count > 0;
+	}
+
+	private bool ShouldWake(RigidBody body)
+	{
+		// Wake if no longer supported from below
+		if (!IsGrounded(body)) return true;
+		// Wake if a fluid force cell touches an exposed face
+		foreach (var (cx, cy) in body.GridCells)
+		foreach (var (dx, dy) in FaceDirections)
+		{
+			int nx = cx + dx, ny = cy + dy;
+			if (!_sim.InBounds(nx, ny)) continue;
+			if (body.GridCells.Contains((nx, ny))) continue;
+			byte c = _sim.Grid[ny * SimW + nx];
+			if (FluidForce(c) > 0f) return true;
+			if (c == (byte)Simulation.Cell.Wood &&
+				_cellToBody.TryGetValue((nx, ny), out var other) &&
+				other != null && !other.Sleeping) return true;
+		}
+		return false;
+	}
+
+	private void StampWoodPreview(Vector2I simPos)
+	{
+		int r = _brushSize;
+		for (int dy = -r; dy <= r; dy++)
+		for (int dx = -r; dx <= r; dx++)
+		{
+			if (dx * dx + dy * dy > r * r) continue;
+			int wx = simPos.X + dx, wy = simPos.Y + dy;
+			if (_sim.InBounds(wx, wy)) _woodPreview.Add((wx, wy));
+		}
+	}
+
+	private void PlaceWood()
+	{
+		if (_woodPreview.Count == 0) return;
+		var cells = new List<(int, int)>(_woodPreview.Count);
+		foreach (var (wx, wy) in _woodPreview)
+		{
+			byte c = _sim.Grid[wy * SimW + wx];
+			if (c == (byte)Simulation.Cell.Air || c == (byte)Simulation.Cell.Steam)
+				cells.Add((wx, wy));
+		}
+		_woodPreview.Clear();
+		if (cells.Count == 0) return;
+
+		var body = new RigidBody(cells);
+		_bodies.Add(body);
+		foreach (var (wx, wy) in cells)
+		{
+			_sim.Grid[wy * SimW + wx] = (byte)Simulation.Cell.Wood;
+			_cellToBody[(wx, wy)] = body;
 		}
 	}
 
@@ -519,6 +941,13 @@ public partial class Main : Control
 	// Drawn by OverlayCanvas (sits above the TextureRect in the scene tree)
 	private void DrawOverlay(OverlayCanvas c)
 	{
+		if (_woodPreview.Count > 0)
+		{
+			var fill = new Color(WoodR / 255f, WoodG / 255f, WoodB / 255f, 0.70f);
+			foreach (var (wx, wy) in _woodPreview)
+				c.DrawRect(new Rect2(wx * Scale, wy * Scale, Scale, Scale), fill);
+		}
+
 		// Heat selection rectangle — white fill + solid white outline
 		if (_selectingHeat || _hasHeatResult)
 		{
@@ -535,8 +964,8 @@ public partial class Main : Control
 	private void SetBrush(int b)
 	{
 		_brush = b;
-		// Clear any heat selection when switching away
 		if (b != BrushHeatView) { _selectingHeat = false; _hasHeatResult = false; }
+		if (b != BrushWood && _placingWood) { _placingWood = false; _woodPreview.Clear(); }
 
 		_btnSand.Modulate    = b == BrushSand    ? Colors.Yellow : Colors.White;
 		_btnWater.Modulate   = b == BrushWater   ? Colors.Yellow : Colors.White;
@@ -627,7 +1056,6 @@ public partial class Main : Control
 			case BrushFood:    StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Food);    break;
 			case BrushCopper:  StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Copper);  break;
 			case BrushBattery: StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Battery); break;
-			case BrushWood:    StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Wood);    break;
 			case BrushErase:   StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Air);     break;
 			case BrushForce:   _sim.ApplyForce(sp.X, sp.Y, _brushSize * 3, 6);        break;
 		}
@@ -703,6 +1131,10 @@ public partial class Main : Control
 				Array.Clear(_sim.VelY,   0, _sim.VelY.Length);
 				Array.Clear(_sim.Pinned, 0, _sim.Pinned.Length);
 				_pinnedSet.Clear();
+				_bodies.Clear();
+				_cellToBody.Clear();
+				_woodPreview.Clear();
+				_placingWood = false;
 				foreach (var gl in _glorps) gl.QueueFree();
 				_glorps.Clear(); _selectedGlorp = null;
 				ConsoleLog("[color=cyan]Grid cleared.[/color]");
