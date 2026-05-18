@@ -19,6 +19,7 @@ public partial class Main : Control
 	private const int BrushCopper   = (int)Simulation.Cell.Copper;
 	private const int BrushBattery  = (int)Simulation.Cell.Battery;
 	private const int BrushWood     = (int)Simulation.Cell.Wood;
+	private const int BrushSteam    = (int)Simulation.Cell.Steam;
 	private const int BrushErase    = -1;
 	private const int BrushForce    = -2;
 	private const int BrushGlorp    = -3;
@@ -80,7 +81,7 @@ public partial class Main : Control
 	// UI nodes
 	private TextureRect _textureRect;
 	private Button _btnSand, _btnWater, _btnStone, _btnLava, _btnGas;
-	private Button _btnFood, _btnGlorp, _btnCopper, _btnBattery, _btnWood, _btnErase, _btnForce;
+	private Button _btnFood, _btnGlorp, _btnCopper, _btnBattery, _btnWood, _btnSteam, _btnErase, _btnForce;
 	private Button _btnTabMaterials, _btnTabSettings, _btnTabAnalysis, _detachBtn;
 	private Button _btnHeatView, _btnPin;
 	private Control _materialsPage, _settingsPage, _analysisPage;
@@ -170,6 +171,7 @@ public partial class Main : Control
 		_btnCopper  = GetNode<Button>(g + "BtnCopper");
 		_btnBattery = GetNode<Button>(g + "BtnBattery");
 		_btnWood    = GetNode<Button>(g + "BtnWood");
+		_btnSteam   = GetNode<Button>(g + "BtnSteam");
 		_btnErase   = GetNode<Button>(g + "BtnErase");
 		_btnForce   = GetNode<Button>(g + "BtnForce");
 
@@ -200,6 +202,7 @@ public partial class Main : Control
 		_btnCopper.Pressed  += () => SetBrush(BrushCopper);
 		_btnBattery.Pressed += () => SetBrush(BrushBattery);
 		_btnWood.Pressed    += () => SetBrush(BrushWood);
+		_btnSteam.Pressed   += () => SetBrush(BrushSteam);
 		_btnErase.Pressed   += () => SetBrush(BrushErase);
 		_btnForce.Pressed   += () => SetBrush(BrushForce);
 		_slider.ValueChanged      += v => _brushSize      = (int)v;
@@ -402,9 +405,6 @@ public partial class Main : Control
 		const float Restitution = 0.2f;
 		const float FricVelX    = 0.85f;
 		const float FricAngVel  = 0.88f;
-		const int   SleepFrames = 10;
-		const float SleepVel    = 0.05f;
-		const float SleepAng    = 0.001f;
 
 		for (int bi = _bodies.Count - 1; bi >= 0; bi--)
 		{
@@ -429,16 +429,7 @@ public partial class Main : Control
 			if (pinned)
 			{
 				body.VelX = body.VelY = body.AngVel = body.SubX = body.SubY = 0;
-				body.Sleeping = false; body.SleepTimer = 0;
 				continue;
-			}
-
-			// Skip sleeping bodies unless something wakes them
-			if (body.Sleeping)
-			{
-				if (!ShouldWake(body)) continue;
-				body.Sleeping = false;
-				body.SleepTimer = 0;
 			}
 
 			// ─ Gravity (suppressed when resting on a surface) ─
@@ -521,27 +512,11 @@ public partial class Main : Control
 			}
 
 			// ─ Friction when in contact with a surface ─
-			bool groundedPost = IsGrounded(body);
-			if (groundedPost)
+			if (IsGrounded(body))
 			{
 				body.VelX   *= FricVelX;
 				body.AngVel *= FricAngVel;
 				if (MathF.Abs(body.VelX) < 0.001f) body.VelX = 0f;
-			}
-
-			// ─ Sleep ─
-			if (groundedPost &&
-				MathF.Abs(body.VelX)   < SleepVel &&
-				MathF.Abs(body.VelY)   < SleepVel &&
-				MathF.Abs(body.AngVel) < SleepAng)
-				body.SleepTimer++;
-			else
-				body.SleepTimer = 0;
-
-			if (body.SleepTimer >= SleepFrames)
-			{
-				body.Sleeping = true;
-				body.VelX = body.VelY = body.AngVel = body.SubX = body.SubY = 0f;
 			}
 		}
 	}
@@ -685,7 +660,6 @@ public partial class Main : Control
 			bodyB.VelX   -= j * n.X / bodyB.Mass;
 			bodyB.VelY   -= j * n.Y / bodyB.Mass;
 			bodyB.AngVel -= (rB.X * (j * n.Y) - rB.Y * (j * n.X)) / bodyB.Inertia;
-			if (bodyB.Sleeping) { bodyB.Sleeping = false; bodyB.SleepTimer = 0; }
 		}
 	}
 
@@ -737,25 +711,7 @@ public partial class Main : Control
 		return blocked.Count > 0;
 	}
 
-	private bool ShouldWake(RigidBody body)
-	{
-		// Wake if no longer supported from below
-		if (!IsGrounded(body)) return true;
-		// Wake if a fluid force cell touches an exposed face
-		foreach (var (cx, cy) in body.GridCells)
-		foreach (var (dx, dy) in FaceDirections)
-		{
-			int nx = cx + dx, ny = cy + dy;
-			if (!_sim.InBounds(nx, ny)) continue;
-			if (body.GridCells.Contains((nx, ny))) continue;
-			byte c = _sim.Grid[ny * SimW + nx];
-			if (FluidForce(c) > 0f) return true;
-			if (c == (byte)Simulation.Cell.Wood &&
-				_cellToBody.TryGetValue((nx, ny), out var other) &&
-				other != null && !other.Sleeping) return true;
-		}
-		return false;
-	}
+
 
 	private void StampWoodPreview(Vector2I simPos)
 	{
@@ -977,6 +933,7 @@ public partial class Main : Control
 		_btnCopper.Modulate  = b == BrushCopper  ? Colors.Yellow : Colors.White;
 		_btnBattery.Modulate = b == BrushBattery ? Colors.Yellow : Colors.White;
 		_btnWood.Modulate    = b == BrushWood    ? Colors.Yellow : Colors.White;
+		_btnSteam.Modulate   = b == BrushSteam   ? Colors.Yellow : Colors.White;
 		_btnErase.Modulate   = b == BrushErase   ? Colors.Yellow : Colors.White;
 		_btnForce.Modulate   = b == BrushForce   ? Colors.Yellow : Colors.White;
 		_btnHeatView.Modulate = b == BrushHeatView ? Colors.Yellow : Colors.White;
@@ -1056,6 +1013,7 @@ public partial class Main : Control
 			case BrushFood:    StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Food);    break;
 			case BrushCopper:  StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Copper);  break;
 			case BrushBattery: StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Battery); break;
+			case BrushSteam:   StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Steam);   break;
 			case BrushErase:   StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Air);     break;
 			case BrushForce:   _sim.ApplyForce(sp.X, sp.Y, _brushSize * 3, 6);        break;
 		}
