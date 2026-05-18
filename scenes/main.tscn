@@ -186,6 +186,31 @@ layout_mode = 2
 size_flags_horizontal = 3
 text = "Mirror"
 
+[node name="BtnDirt" type="Button" parent="UI/ToolBox/Panel/VBoxContainer/MaterialsPage/ButtonGrid"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Dirt"
+
+[node name="BtnGrassSeed" type="Button" parent="UI/ToolBox/Panel/VBoxContainer/MaterialsPage/ButtonGrid"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Grass Seed"
+
+[node name="BtnTreeSeed" type="Button" parent="UI/ToolBox/Panel/VBoxContainer/MaterialsPage/ButtonGrid"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Tree Seed"
+
+[node name="BtnFire" type="Button" parent="UI/ToolBox/Panel/VBoxContainer/MaterialsPage/ButtonGrid"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Fire"
+
+[node name="BtnLiquidNitrogen" type="Button" parent="UI/ToolBox/Panel/VBoxContainer/MaterialsPage/ButtonGrid"]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Liq. N2"
+
 [node name="SizeLabel" type="Label" parent="UI/ToolBox/Panel/VBoxContainer/MaterialsPage"]
 layout_mode = 2
 text = "Brush Size"
