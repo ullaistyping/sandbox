@@ -120,10 +120,10 @@ public partial class Main : Control
 	private TextureRect _textureRect;
 	private Button _btnSand, _btnWater, _btnStone, _btnLava, _btnGas;
 	private Button _btnFood, _btnGlorp, _btnCopper, _btnBattery, _btnWood, _btnErase, _btnForce;
-	private Button _btnTabMaterials, _btnTabSettings, _btnTabAnalysis, _detachBtn;
+	private Button _btnTabMaterials, _btnTabSettings, _btnTabAnalysis, _btnTabQuick, _detachBtn;
 	private Button _btnHeatView, _btnPin, _btnTurret, _btnMirror;
 	private Button _btnDirt, _btnGrassSeed, _btnTreeSeed, _btnFire, _btnLiquidNitrogen, _btnArm;
-	private Control _materialsPage, _settingsPage, _analysisPage;
+	private Control _materialsPage, _settingsPage, _analysisPage, _quickSelectPage;
 	private Label   _heatResultLabel;
 	private HSlider _slider, _speedSlider;
 	private Panel   _panel, _tab;
@@ -139,7 +139,7 @@ public partial class Main : Control
 	private const float ToolBoxH = 270f;
 
 	// Panel tween
-	private const float  PanelHiddenY   = -240f;
+	private const float  PanelHiddenY   = -380f;  // must equal the panel's height in main.tscn
 	private const float  PanelShownY    = 30f;
 	private const double PanelTweenTime = 0.22;
 
@@ -161,6 +161,19 @@ public partial class Main : Control
 	// Bezier mirrors
 	private readonly List<BezierMirror> _mirrors = new();
 	private BezierMirror _mirrorInProgress;
+
+	// Wire overlay system
+	private readonly List<WireNode> _wireNodes     = new();
+	private int     _wirePendingIdx = -1;    // first-click node awaiting second click; -1 = none
+	private bool    _wireModeActive = false;
+	private float   _wireSnapRadius = 8f;    // sim-cell radius for snapping to batteries/terminals/nodes
+	private Vector2 _mouseSimF;              // float-precision mouse in sim space (for wire ghost)
+
+	// Quick select radial
+	private bool    _radialOpen         = false;
+	private Vector2 _radialOriginScreen;
+	private int     _radialHoveredSlot  = -1;   // -1 = dead zone; 0-5 = slice index
+	private double  _radialInputCooldown = 0.0; // seconds before brush input resumes after close
 
 	// Robotic arms
 	private readonly List<RoboArm> _arms = new();
@@ -243,11 +256,13 @@ public partial class Main : Control
 		_btnTabMaterials = GetNode<Button>("UI/ToolBox/Panel/VBoxContainer/TabBar/BtnTabMaterials");
 		_btnTabSettings  = GetNode<Button>("UI/ToolBox/Panel/VBoxContainer/TabBar/BtnTabSettings");
 		_btnTabAnalysis  = GetNode<Button>("UI/ToolBox/Panel/VBoxContainer/TabBar/BtnTabAnalysis");
+		_btnTabQuick     = GetNode<Button>("UI/ToolBox/Panel/VBoxContainer/TabBar/BtnTabQuick");
 		_detachBtn       = GetNode<Button>("UI/ToolBox/Tab/DetachBtn");
 
-		_materialsPage = GetNode<Control>("UI/ToolBox/Panel/VBoxContainer/MaterialsPage");
-		_settingsPage  = GetNode<Control>("UI/ToolBox/Panel/VBoxContainer/SettingsPage");
-		_analysisPage  = GetNode<Control>("UI/ToolBox/Panel/VBoxContainer/AnalysisPage");
+		_materialsPage    = GetNode<Control>("UI/ToolBox/Panel/VBoxContainer/MaterialsPage");
+		_settingsPage     = GetNode<Control>("UI/ToolBox/Panel/VBoxContainer/SettingsPage");
+		_analysisPage     = GetNode<Control>("UI/ToolBox/Panel/VBoxContainer/AnalysisPage");
+		_quickSelectPage  = GetNode<Control>("UI/ToolBox/Panel/VBoxContainer/QuickSelectPage");
 
 		const string ap = "UI/ToolBox/Panel/VBoxContainer/AnalysisPage/";
 		_btnHeatView     = GetNode<Button>(ap + "AnalysisRow/BtnHeatView");
@@ -280,7 +295,11 @@ public partial class Main : Control
 		_btnTabMaterials.Pressed += () => SetActiveTab(0);
 		_btnTabSettings.Pressed  += () => SetActiveTab(1);
 		_btnTabAnalysis.Pressed  += () => SetActiveTab(2);
+		_btnTabQuick.Pressed     += () => SetActiveTab(3);
 		_detachBtn.Pressed       += ToggleDetach;
+
+		InitQuickSelect();
+		ApplyMaterialButtonColors();
 		_btnHeatView.Pressed     += () => SetBrush(BrushHeatView);
 		_btnPin.Pressed          += () => SetBrush(BrushPin);
 
@@ -325,16 +344,25 @@ public partial class Main : Control
 		_overlay.QueueRedraw();
 
 		Vector2 mouse = GetViewport().GetMousePosition();
-		_mouseSim = ScreenToSim(mouse);
+		_mouseSim  = ScreenToSim(mouse);
+		_mouseSimF = ScreenToSimF(mouse);
+		// Wire power runs after the last sim tick so it writes into Electric[] after
+		// PropagateElectricity has built the copper network for this frame.
+		PropagateWirePower();
 		UpdateTurrets();
 		UpdateArms();
+
+		// Update radial hover every frame (before UI early-returns so it's always live)
+		if (_radialOpen) UpdateRadialHover(mouse);
 
 		// ImGui must be submitted every frame — do this before any early returns
 		DrawDebugGui();
 
 		if (!_detached)
 		{
-			bool inToolBox = _toolBox.GetGlobalRect().HasPoint(mouse);
+			// Trigger on the small tab strip only; keep open while mouse is over the panel.
+			bool inToolBox = _tab.GetGlobalRect().HasPoint(mouse)
+				|| (_toolBoxExpanded && _panel.GetGlobalRect().HasPoint(mouse));
 			if (inToolBox != _toolBoxExpanded)
 			{
 				if (inToolBox) ShowPanel(); else HidePanel();
@@ -356,6 +384,14 @@ public partial class Main : Control
 			UpdateArmDrag(ScreenToSimF(mouse));
 			return;
 		}
+
+		// Wire mode and radial: all interaction handled in _Input
+		if (_wireModeActive) return;
+		if (_radialOpen)     return;
+
+		// Post-radial cooldown — suppress brush input briefly so the releasing button
+		// doesn't immediately paint the cell under the cursor.
+		if (_radialInputCooldown > 0) { _radialInputCooldown -= delta; return; }
 
 		if (lmbHeld)
 		{
@@ -407,6 +443,20 @@ public partial class Main : Control
 				GetViewport().SetInputAsHandled();
 				return;
 			}
+			if (k.Keycode == Key.Z && !ImGuiNET.ImGui.GetIO().WantCaptureKeyboard)
+			{
+				_wireModeActive = !_wireModeActive;
+				if (!_wireModeActive) _wirePendingIdx = -1; // cancel pending wire on exit
+				GetViewport().SetInputAsHandled();
+				return;
+			}
+			if (k.Keycode == Key.Escape && _wireModeActive && !ImGuiNET.ImGui.GetIO().WantCaptureKeyboard)
+			{
+				if (_wirePendingIdx >= 0) _wirePendingIdx = -1; // cancel pending first, then exit on next Esc
+				else _wireModeActive = false;
+				GetViewport().SetInputAsHandled();
+				return;
+			}
 			// Yield Space to ImGui when a text input is focused (e.g. console tab).
 		if (k.Keycode == Key.Space && !ImGuiNET.ImGui.GetIO().WantCaptureKeyboard)
 			{
@@ -450,6 +500,34 @@ public partial class Main : Control
 
 			if (mb.Pressed)
 			{
+				// Both buttons held simultaneously opens the radial quick-select menu
+				if (!_radialOpen && !overUI &&
+					((mb.ButtonIndex == MouseButton.Left  && Input.IsMouseButtonPressed(MouseButton.Right)) ||
+					 (mb.ButtonIndex == MouseButton.Right && Input.IsMouseButtonPressed(MouseButton.Left))))
+				{
+					OpenRadial(mb.Position);
+					_suppressRightErase = true;
+					GetViewport().SetInputAsHandled();
+					return;
+				}
+
+				// Wire mode intercepts LMB and RMB before all other brush logic
+				if (_wireModeActive && !overUI)
+				{
+					if (mb.ButtonIndex == MouseButton.Left)
+					{
+						PlaceWireClick(ScreenToSimF(mouse));
+						GetViewport().SetInputAsHandled();
+						return;
+					}
+					if (mb.ButtonIndex == MouseButton.Right)
+					{
+						TryDeleteWireNode(ScreenToSimF(mouse));
+						GetViewport().SetInputAsHandled();
+						return;
+					}
+				}
+
 				if (mb.ButtonIndex == MouseButton.Left)
 				{
 					// Arm-joint drag takes priority over every brush — clicking near
@@ -512,6 +590,14 @@ public partial class Main : Control
 			}
 			else // released
 			{
+				// Either button released while radial is open → close and apply selection
+				if (_radialOpen && (mb.ButtonIndex == MouseButton.Left || mb.ButtonIndex == MouseButton.Right))
+				{
+					CloseRadial();
+					GetViewport().SetInputAsHandled();
+					return;
+				}
+
 				if (mb.ButtonIndex == MouseButton.Left)
 				{
 					if (_armDrag != null)
@@ -758,6 +844,8 @@ public partial class Main : Control
 		_mirrorInProgress?.Draw(c, mirrorColWip);
 		DrawTurrets(c);
 		DrawArms(c);
+		// Wire overlay — only visible while wire mode is active (Z to toggle)
+		if (_wireModeActive) DrawWires(c);
 		// Shockwave rings
 		foreach (var sw in _shockwaves)
 		{
@@ -766,7 +854,8 @@ public partial class Main : Control
 			c.DrawArc(sw.Center, sw.Radius, 0, MathF.PI * 2f, 48, new Color(1f, 0.85f, 0.35f, a * 0.85f),  2f);
 			c.DrawArc(sw.Center, sw.Radius * 0.25f, 0, MathF.PI * 2f, 24, new Color(1f, 0.95f, 0.8f, a * a * 0.6f), 5f);
 		}
-		DrawBrushCursor(c);
+		if (_radialOpen) DrawRadial(c);
+		else DrawBrushCursor(c);
 	}
 
 	private void DrawBrushCursor(OverlayCanvas c)
@@ -900,12 +989,14 @@ public partial class Main : Control
 
 	private void SetActiveTab(int tab)
 	{
-		_materialsPage.Visible = (tab == 0);
-		_settingsPage.Visible  = (tab == 1);
-		_analysisPage.Visible  = (tab == 2);
+		_materialsPage.Visible   = (tab == 0);
+		_settingsPage.Visible    = (tab == 1);
+		_analysisPage.Visible    = (tab == 2);
+		_quickSelectPage.Visible = (tab == 3);
 		_btnTabMaterials.Modulate = tab == 0 ? Colors.Yellow : Colors.White;
 		_btnTabSettings.Modulate  = tab == 1 ? Colors.Yellow : Colors.White;
 		_btnTabAnalysis.Modulate  = tab == 2 ? Colors.Yellow : Colors.White;
+		_btnTabQuick.Modulate     = tab == 3 ? Colors.Yellow : Colors.White;
 	}
 
 	private void ToggleDetach()
@@ -1531,6 +1622,261 @@ public partial class Main : Control
 		}
 		waypoints.Add(pos + curDir * segRange);
 		return waypoints;
+	}
+
+	// ── Wire system ────────────────────────────────────────────────────────────
+	// Wires exist on a separate overlay plane — no grid cells, invisible outside
+	// wire mode (Z key). They form an undirected graph; power floods from nodes
+	// anchored to Battery cells outward through the graph, then writes Electric[]
+	// at machine terminals so turrets and arms receive power normally.
+
+	private sealed class WireNode
+	{
+		public Vector2            Pos;                         // sim-space float position
+		public readonly List<int> Connections = new();        // indices into _wireNodes (undirected)
+		public int                AnchorIdx   = -1;           // grid cell if snapped to battery/terminal; -1 if free junction
+		public bool               Powered;                    // set by PropagateWirePower each frame
+	}
+
+	// Returns the snapped sim position for a cursor. Preference order by distance:
+	// battery cells → machine terminals → existing wire nodes → cursor unchanged.
+	private Vector2 FindWireSnap(Vector2 simPos, out int anchorIdx, out int existingNodeIdx)
+	{
+		anchorIdx      = -1;
+		existingNodeIdx = -1;
+		float   best    = _wireSnapRadius;
+		Vector2 snapPos = simPos;
+
+		// Battery cells — walk a bounding box around the cursor
+		int cx = (int)simPos.X, cy = (int)simPos.Y;
+		int r  = (int)MathF.Ceiling(_wireSnapRadius);
+		for (int dy = -r; dy <= r; dy++)
+		for (int dx = -r; dx <= r; dx++)
+		{
+			int gx = cx + dx, gy = cy + dy;
+			if (!_sim.InBounds(gx, gy)) continue;
+			int idx = gy * SimW + gx;
+			if (_sim.Grid[idx] != (byte)Simulation.Cell.Battery) continue;
+			float dist = simPos.DistanceTo(new Vector2(gx + 0.5f, gy + 0.5f));
+			if (dist < best)
+			{
+				best = dist;
+				snapPos        = new Vector2(gx + 0.5f, gy + 0.5f);
+				anchorIdx      = idx;
+				existingNodeIdx = -1;
+			}
+		}
+
+		// Turret copper terminals
+		foreach (var t in _turrets)
+		{
+			int row = t.Origin.Y + 1;
+			foreach (int tx in new[] { t.Origin.X - LaserTurret.BaseHalfW - 1, t.Origin.X + LaserTurret.BaseHalfW + 1 })
+			{
+				if (!_sim.InBounds(tx, row)) continue;
+				float dist = simPos.DistanceTo(new Vector2(tx + 0.5f, row + 0.5f));
+				if (dist < best)
+				{
+					best = dist;
+					snapPos        = new Vector2(tx + 0.5f, row + 0.5f);
+					anchorIdx      = row * SimW + tx;
+					existingNodeIdx = -1;
+				}
+			}
+		}
+
+		// Arm copper terminals
+		foreach (var a in _arms)
+		{
+			int termY = a.Origin.Y;
+			foreach (int tx in new[] { a.Origin.X - RoboArm.BaseHalfW - 1, a.Origin.X + RoboArm.BaseHalfW + 1 })
+			{
+				if (!_sim.InBounds(tx, termY)) continue;
+				float dist = simPos.DistanceTo(new Vector2(tx + 0.5f, termY + 0.5f));
+				if (dist < best)
+				{
+					best = dist;
+					snapPos        = new Vector2(tx + 0.5f, termY + 0.5f);
+					anchorIdx      = termY * SimW + tx;
+					existingNodeIdx = -1;
+				}
+			}
+		}
+
+		// Existing wire nodes (don't snap a pending node to itself)
+		for (int i = 0; i < _wireNodes.Count; i++)
+		{
+			if (i == _wirePendingIdx) continue;
+			float dist = simPos.DistanceTo(_wireNodes[i].Pos);
+			if (dist < best)
+			{
+				best           = dist;
+				snapPos        = _wireNodes[i].Pos;
+				anchorIdx      = _wireNodes[i].AnchorIdx;
+				existingNodeIdx = i;
+			}
+		}
+
+		return snapPos;
+	}
+
+	// LMB click in wire mode: place or reuse a node and connect it to the pending node.
+	private void PlaceWireClick(Vector2 simPos)
+	{
+		var snapPos = FindWireSnap(simPos, out int anchorIdx, out int existingIdx);
+
+		int targetIdx;
+		if (existingIdx >= 0)
+		{
+			// Clicked near an existing node — connect to it rather than spawning a new one
+			targetIdx = existingIdx;
+		}
+		else
+		{
+			_wireNodes.Add(new WireNode { Pos = snapPos, AnchorIdx = anchorIdx });
+			targetIdx = _wireNodes.Count - 1;
+		}
+
+		if (_wirePendingIdx >= 0 && _wirePendingIdx != targetIdx
+			&& !_wireNodes[_wirePendingIdx].Connections.Contains(targetIdx))
+		{
+			_wireNodes[_wirePendingIdx].Connections.Add(targetIdx);
+			_wireNodes[targetIdx].Connections.Add(_wirePendingIdx);
+		}
+
+		_wirePendingIdx = targetIdx;
+		_sim.RenderDirty = true;
+	}
+
+	// RMB click in wire mode: cancel pending first; if none, delete the nearest node
+	// and all its edges.
+	private void TryDeleteWireNode(Vector2 simPos)
+	{
+		if (_wirePendingIdx >= 0) { _wirePendingIdx = -1; return; }
+
+		float best   = _wireSnapRadius;
+		int   hitIdx = -1;
+		for (int i = 0; i < _wireNodes.Count; i++)
+		{
+			float d = simPos.DistanceTo(_wireNodes[i].Pos);
+			if (d < best) { best = d; hitIdx = i; }
+		}
+		if (hitIdx < 0) return;
+
+		// Remove edges from every neighbour that pointed to this node
+		foreach (int ci in _wireNodes[hitIdx].Connections)
+			_wireNodes[ci].Connections.Remove(hitIdx);
+
+		_wireNodes.RemoveAt(hitIdx);
+
+		// Fix up all indices that shifted after the RemoveAt
+		for (int i = 0; i < _wireNodes.Count; i++)
+			for (int j = 0; j < _wireNodes[i].Connections.Count; j++)
+				if (_wireNodes[i].Connections[j] > hitIdx)
+					_wireNodes[i].Connections[j]--;
+
+		if      (_wirePendingIdx == hitIdx) _wirePendingIdx = -1;
+		else if (_wirePendingIdx  > hitIdx) _wirePendingIdx--;
+
+		_sim.RenderDirty = true;
+	}
+
+	// Called every frame after sim ticks. BFS from battery-anchored nodes,
+	// then writes Electric[] at powered terminal nodes so machines see power.
+	private void PropagateWirePower()
+	{
+		if (_wireNodes.Count == 0) return;
+
+		foreach (var n in _wireNodes) n.Powered = false;
+
+		var queue = new Queue<int>();
+		for (int i = 0; i < _wireNodes.Count; i++)
+		{
+			var n = _wireNodes[i];
+			if (n.AnchorIdx >= 0 && _sim.Grid[n.AnchorIdx] == (byte)Simulation.Cell.Battery)
+			{ n.Powered = true; queue.Enqueue(i); }
+		}
+		while (queue.Count > 0)
+		{
+			int ci = queue.Dequeue();
+			foreach (int ni in _wireNodes[ci].Connections)
+			{
+				if (!_wireNodes[ni].Powered)
+				{ _wireNodes[ni].Powered = true; queue.Enqueue(ni); }
+			}
+		}
+
+		// Deliver power to machine terminals via the existing Electric[] channel
+		foreach (var n in _wireNodes)
+		{
+			if (n.Powered && n.AnchorIdx >= 0
+				&& _sim.Grid[n.AnchorIdx] != (byte)Simulation.Cell.Battery)
+				_sim.Electric[n.AnchorIdx] = 1;
+		}
+	}
+
+	// Draws the wire graph overlay. Only called when _wireModeActive = true.
+	private void DrawWires(OverlayCanvas c)
+	{
+		var poweredEdge   = new Color(1.00f, 0.85f, 0.15f, 0.90f); // warm yellow
+		var unpoweredEdge = new Color(0.40f, 0.40f, 0.45f, 0.70f); // dim grey
+		var poweredNode   = new Color(1.00f, 0.95f, 0.40f, 1.00f);
+		var unpoweredNode = new Color(0.50f, 0.50f, 0.55f, 1.00f);
+		var pendingCol    = new Color(0.40f, 0.85f, 1.00f, 1.00f); // cyan = awaiting second click
+		var anchorRingCol = new Color(1.00f, 1.00f, 1.00f, 0.55f); // white halo for anchored nodes
+		var ghostCol      = new Color(0.40f, 0.85f, 1.00f, 0.45f);
+
+		// Edges — draw each undirected edge once (j > i guard)
+		for (int i = 0; i < _wireNodes.Count; i++)
+		{
+			var  a  = _wireNodes[i];
+			var  pa = a.Pos * Scale;
+			foreach (int j in a.Connections)
+			{
+				if (j <= i) continue;
+				var b       = _wireNodes[j];
+				bool powered = a.Powered && b.Powered;
+				c.DrawLine(pa, b.Pos * Scale, powered ? poweredEdge : unpoweredEdge, 2.0f);
+			}
+		}
+
+		// Nodes
+		for (int i = 0; i < _wireNodes.Count; i++)
+		{
+			var     n   = _wireNodes[i];
+			Vector2 p   = n.Pos * Scale;
+			bool    isPending = i == _wirePendingIdx;
+			var     col = isPending ? pendingCol : (n.Powered ? poweredNode : unpoweredNode);
+			float   rad = n.AnchorIdx >= 0 ? 4.0f : 2.8f; // anchored nodes are slightly larger
+			// White halo distinguishes anchored (battery/terminal) nodes from free junctions
+			if (n.AnchorIdx >= 0)
+				c.DrawCircle(p, rad + 2.0f, anchorRingCol);
+			c.DrawCircle(p, rad, col);
+		}
+
+		// Ghost wire + snap indicator when a pending node is waiting for second click
+		if (_wirePendingIdx >= 0 && _wirePendingIdx < _wireNodes.Count)
+		{
+			var snapPos = FindWireSnap(_mouseSimF, out _, out _);
+			Vector2 from = _wireNodes[_wirePendingIdx].Pos * Scale;
+			Vector2 to   = snapPos * Scale;
+			c.DrawLine(from, to, ghostCol, 1.5f);
+			c.DrawCircle(to, 2.8f, ghostCol);
+		}
+		else
+		{
+			// No pending node: show a subtle snap indicator at cursor position
+			var snapPos = FindWireSnap(_mouseSimF, out int snapAnchor, out _);
+			bool snapped = snapAnchor >= 0 || snapPos.DistanceTo(_mouseSimF) > 0.1f;
+			if (snapped)
+			{
+				var snapIndicatorCol = new Color(0.40f, 0.85f, 1.00f, 0.60f);
+				c.DrawCircle(snapPos * Scale, 3.5f, snapIndicatorCol);
+			}
+		}
+
+		// Wire mode indicator label — drawn via debug output, not overlay
+		// (visible because the overlay has no text-drawing API)
 	}
 
 	// ── LaserTurret ────────────────────────────────────────────────────────────

@@ -42,6 +42,7 @@ public partial class Main
 			DrawFirePlantsTab();
 			DrawLaserTab();
 			DrawMirrorsTab();
+			DrawWireTab();
 			DrawArmTab();
 			DrawGlorpTab();
 			DrawConsoleTab();
@@ -178,6 +179,46 @@ public partial class Main
 		float md = BezierMirror.RawMinDist;
 		if (ImGui.SliderFloat("Sample Dist", ref md, 0.2f, 10f, "%.2f")) BezierMirror.RawMinDist = md;
 		ImGui.SetItemTooltip("Minimum chord distance between raw mouse samples (sim units) — sets base resolution of the drawn mirror");
+
+		ImGui.EndTabItem();
+	}
+
+	private void DrawWireTab()
+	{
+		if (!ImGui.BeginTabItem("Wire")) return;
+
+		ImGui.SeparatorText("Controls");
+		ImGui.TextDisabled("Z — toggle wire mode   LMB — place node   RMB — cancel / delete node   Esc — cancel pending");
+
+		ImGui.SeparatorText("Settings");
+		float sr = _wireSnapRadius;
+		if (ImGui.SliderFloat("Snap Radius", ref sr, 2f, 20f, "%.1f"))
+			_wireSnapRadius = sr;
+		ImGui.SetItemTooltip(
+			"How close (sim cells) the cursor must be to a battery, machine terminal,\n" +
+			"or existing wire node to snap to it instead of placing a free junction.");
+
+		ImGui.SeparatorText("State");
+		ImGui.Text($"Mode active: {(_wireModeActive ? "YES (Z to exit)" : "no (Z to enter)")}");
+		ImGui.Text($"Nodes: {_wireNodes.Count}");
+		int edgeCount = 0;
+		foreach (var n in _wireNodes) edgeCount += n.Connections.Count;
+		ImGui.Text($"Edges: {edgeCount / 2}");
+		int powered = 0;
+		foreach (var n in _wireNodes) if (n.Powered) powered++;
+		ImGui.Text($"Powered nodes: {powered} / {_wireNodes.Count}");
+		if (_wirePendingIdx >= 0)
+			ImGui.TextColored(new System.Numerics.Vector4(0.4f, 0.85f, 1f, 1f),
+				$"Pending node #{_wirePendingIdx} — click to connect");
+		else
+			ImGui.TextDisabled("No pending node");
+
+		if (ImGui.Button("Clear All Wires"))
+		{
+			_wireNodes.Clear();
+			_wirePendingIdx = -1;
+		}
+		ImGui.SetItemTooltip("Remove every wire node and edge from the world.");
 
 		ImGui.EndTabItem();
 	}
@@ -393,6 +434,9 @@ public partial class Main
 		cfg.SetValue("Mirrors", "rdpEpsilon",  BezierMirror.RdpEpsilon);
 		cfg.SetValue("Mirrors", "rawMinDist",  BezierMirror.RawMinDist);
 
+		// Wire
+		cfg.SetValue("Wire", "snapRadius", _wireSnapRadius);
+
 		// Arm
 		cfg.SetValue("Arm", "pincerHalfWidth", _pincerHalfWidth);
 		cfg.SetValue("Arm", "pincerDepth",     _pincerDepth);
@@ -413,6 +457,8 @@ public partial class Main
 		cfg.SetValue("Glorp", "senseRange",         Glorp.SenseRange);
 		cfg.SetValue("Glorp", "eatRange",           Glorp.EatRange);
 		cfg.SetValue("Glorp", "talkRange",          Glorp.TalkRange);
+
+		SaveQuickProfiles(cfg);
 
 		cfg.Save(CfgPath);
 		ConsoleLog("[color=cyan]Settings saved.[/color]");
@@ -462,6 +508,9 @@ public partial class Main
 		BezierMirror.RawMinDist = G("Mirrors","rawMinDist", BezierMirror.RawMinDist);
 
 		// Arm
+		// Wire
+		_wireSnapRadius = Math.Clamp(G("Wire","snapRadius", _wireSnapRadius), 2f, 20f);
+
 		_pincerHalfWidth = Math.Clamp(I("Arm","pincerHalfWidth", _pincerHalfWidth), 0, RoboArm.MaxPincerHalfWidth);
 		_pincerDepth     = Math.Clamp(I("Arm","pincerDepth",     _pincerDepth),     1, RoboArm.MaxPincerDepth);
 
@@ -481,5 +530,7 @@ public partial class Main
 		Glorp.SenseRange        = G("Glorp","senseRange",       Glorp.SenseRange);
 		Glorp.EatRange          = G("Glorp","eatRange",         Glorp.EatRange);
 		Glorp.TalkRange         = G("Glorp","talkRange",        Glorp.TalkRange);
+
+		LoadQuickProfiles(cfg);
 	}
 }
