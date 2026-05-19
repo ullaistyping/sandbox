@@ -142,14 +142,10 @@ public partial class Main : Control
 	private const float  PanelShownY    = 30f;
 	private const double PanelTweenTime = 0.22;
 
-	// Console
-	private Panel         _consolePanel;
-	private RichTextLabel _consoleOutput;
-	private LineEdit      _consoleInput;
-	private bool          _consoleOpen;
-
 	// Turrets
 	private readonly List<LaserTurret> _turrets = new();
+	private float _laserFalloff     = 0.4f; // power multiplier applied per bounce (0=instant, 1=no decay)
+	private int   _laserMaxBounces  = 12;   // hard cap on mirror reflections per beam
 	private Vector2I _mouseSim;
 
 	// Shockwaves
@@ -160,6 +156,10 @@ public partial class Main : Control
 	private readonly List<Glorp> _glorps = new();
 	private Glorp _selectedGlorp;
 	private bool  _suppressRightErase;
+
+	// Bezier mirrors
+	private readonly List<BezierMirror> _mirrors = new();
+	private BezierMirror _mirrorInProgress;
 
 	// Heat viewer
 	private Vector2I _heatStart, _heatEnd;
@@ -265,13 +265,9 @@ public partial class Main : Control
 		_btnHeatView.Pressed     += () => SetBrush(BrushHeatView);
 		_btnPin.Pressed          += () => SetBrush(BrushPin);
 
-		_consolePanel  = GetNode<Panel>("UI/ConsolePanel");
-		_consoleOutput = GetNode<RichTextLabel>("UI/ConsolePanel/ConsoleVBox/ConsoleOutput");
-		_consoleInput  = GetNode<LineEdit>("UI/ConsolePanel/ConsoleVBox/ConsoleInput");
-		_consoleInput.TextSubmitted += ExecuteCommand;
-
 		SetActiveTab(0);
 		SetBrush(BrushSand);
+		LoadConfig();
 	}
 
 	// ── Process ───────────────────────────────────────────────────────────────
@@ -302,12 +298,19 @@ public partial class Main : Control
 			_shockwaves[si] = sw;
 			if (sw.Life <= 0f) _shockwaves.RemoveAt(si);
 		}
-		Render();
+		if (_sim.RenderDirty)
+		{
+			Render();
+			_sim.RenderDirty = false;
+		}
 		_overlay.QueueRedraw();
 
 		Vector2 mouse = GetViewport().GetMousePosition();
 		_mouseSim = ScreenToSim(mouse);
 		UpdateTurrets();
+
+		// ImGui must be submitted every frame — do this before any early returns
+		DrawDebugGui();
 
 		if (!_detached)
 		{
@@ -318,7 +321,8 @@ public partial class Main : Control
 			}
 		}
 
-		// Block brush from firing over UI
+		// Block game input when any UI owns the mouse
+		if (ImGuiNET.ImGui.GetIO().WantCaptureMouse) return;
 		if (_tab.GetGlobalRect().HasPoint(mouse)) return;
 		if (_detached  && _toolBox.GetGlobalRect().HasPoint(mouse)) return;
 		if (!_detached && _toolBoxExpanded && _panel.GetGlobalRect().HasPoint(mouse)) return;
@@ -338,6 +342,9 @@ public partial class Main : Control
 				case BrushPin:
 					ApplyPin(simPos, _pinSetMode);
 					break;
+				case BrushMirror:
+					_mirrorInProgress?.AddSample(ScreenToSimF(mouse));
+					break;
 				default:
 					ApplyBrush(mouse);
 					break;
@@ -353,6 +360,7 @@ public partial class Main : Control
 			{
 				StampCircle(simPos.X, simPos.Y, (int)Simulation.Cell.Air);
 				EraseTurretsInRadius(simPos.X, simPos.Y, _brushSize);
+				EraseMirrorsInRadius(simPos.X, simPos.Y, _brushSize);
 			}
 		}
 	}
@@ -361,21 +369,13 @@ public partial class Main : Control
 
 	public override void _Input(InputEvent @event)
 	{
-		// Console toggle / autocomplete
+		// Debug panel toggle
 		if (@event is InputEventKey k && k.Pressed && !k.Echo)
 		{
 			if (k.Keycode == Key.Quoteleft)
 			{
-				_consoleOpen = !_consoleOpen;
-				_consolePanel.Visible = _consoleOpen;
-				if (_consoleOpen) _consoleInput.GrabFocus();
-				else              _consoleInput.ReleaseFocus();
-				GetViewport().SetInputAsHandled();
-				return;
-			}
-			if (_consoleOpen && k.Keycode == Key.Tab)
-			{
-				ConsoleAutocomplete();
+				_showDebugGui = !_showDebugGui;
+				_debugWinGeomLoaded = false; // re-apply saved position on next open
 				GetViewport().SetInputAsHandled();
 				return;
 			}
@@ -408,7 +408,8 @@ public partial class Main : Control
 		if (@event is InputEventMouseButton mb)
 		{
 			var mouse = mb.Position;
-			bool overUI = _tab.GetGlobalRect().HasPoint(mouse)
+			bool overUI = ImGuiNET.ImGui.GetIO().WantCaptureMouse
+						|| _tab.GetGlobalRect().HasPoint(mouse)
 						|| (_toolBoxExpanded && _panel.GetGlobalRect().HasPoint(mouse))
 						|| (_detached        && _toolBox.GetGlobalRect().HasPoint(mouse));
 
@@ -438,6 +439,11 @@ public partial class Main : Control
 					{
 						PlaceTurret(ScreenToSim(mouse));
 					}
+					else if (_brush == BrushMirror && !overUI)
+					{
+						_mirrorInProgress = new BezierMirror();
+						_mirrorInProgress.AddSample(ScreenToSimF(mouse));
+					}
 				}
 				else if (mb.ButtonIndex == MouseButton.Right)
 				{
@@ -459,6 +465,12 @@ public partial class Main : Control
 					{
 						_selectingHeat = false;
 						_hasHeatResult = true;
+					}
+					else if (_mirrorInProgress != null)
+					{
+						if (_mirrorInProgress.SamplePoints.Count >= 2)
+							_mirrors.Add(_mirrorInProgress);
+						_mirrorInProgress = null;
 					}
 				}
 			}
@@ -503,6 +515,7 @@ public partial class Main : Control
 			if (pin) _pinnedSet.Add(idx);
 			else     _pinnedSet.Remove(idx);
 		}
+		_sim.RenderDirty = true; // pinned cells are tinted in the render
 	}
 
 	// ── Rendering ─────────────────────────────────────────────────────────────
@@ -680,15 +693,12 @@ public partial class Main : Control
 			c.DrawRect(selRect, new Color(1, 1, 1, 0.12f));           // subtle white fill
 			c.DrawRect(selRect, new Color(1, 1, 1, 0.95f), false, 2f); // bright white outline
 		}
-		// Mirror cells — draw × to indicate reflective surface (orientation is turret-relative, not stored)
-		for (int my = 0; my < SimH; my++)
-		for (int mx = 0; mx < SimW; mx++)
-		{
-			if (_sim.Grid[my * SimW + mx] != (byte)Simulation.Cell.Mirror) continue;
-			float sx = mx * Scale, sy = my * Scale;
-			c.DrawLine(new Vector2(sx,         sy        ), new Vector2(sx + Scale, sy + Scale), new Color(1f, 1f, 1f, 0.80f), 1f);
-			c.DrawLine(new Vector2(sx + Scale, sy        ), new Vector2(sx,         sy + Scale), new Color(1f, 1f, 1f, 0.80f), 1f);
-		}
+		// Bezier mirrors — draw committed curves then in-progress stroke (dimmer)
+		var mirrorCol   = new Color(0.82f, 0.92f, 1.00f, 0.95f);
+		var mirrorColWip = new Color(0.82f, 0.92f, 1.00f, 0.45f);
+		foreach (var m in _mirrors)
+			m.Draw(c, mirrorCol);
+		_mirrorInProgress?.Draw(c, mirrorColWip);
 		DrawTurrets(c);
 		// Shockwave rings
 		foreach (var sw in _shockwaves)
@@ -704,6 +714,11 @@ public partial class Main : Control
 
 	private void SetBrush(int b)
 	{
+		if (b != BrushMirror && _mirrorInProgress != null)
+		{
+			if (_mirrorInProgress.SamplePoints.Count >= 2) _mirrors.Add(_mirrorInProgress);
+			_mirrorInProgress = null;
+		}
 		_brush = b;
 		// Clear any heat selection when switching away
 		if (b != BrushHeatView) { _selectingHeat = false; _hasHeatResult = false; }
@@ -791,6 +806,9 @@ public partial class Main : Control
 		new Vector2I(Math.Clamp((int)(screen.X / Scale), 0, SimW - 1),
 					 Math.Clamp((int)(screen.Y / Scale), 0, SimH - 1));
 
+	private static Vector2 ScreenToSimF(Vector2 screen) =>
+		new Vector2(screen.X / Scale, screen.Y / Scale);
+
 	private void ApplyBrush(Vector2 screenPos)
 	{
 		var sp = ScreenToSim(screenPos);
@@ -805,9 +823,12 @@ public partial class Main : Control
 			case BrushCopper:  StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Copper);  break;
 			case BrushBattery: StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Battery); break;
 			case BrushWood:    StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Wood);    break;
-			case BrushErase:       StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Air); EraseTurretsInRadius(sp.X, sp.Y, _brushSize); break;
-			case BrushForce:       _sim.ApplyForce(sp.X, sp.Y, _brushSize * 3, 6);        break;
-			case BrushMirror:    StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Mirror);    break;
+			case BrushErase:
+				StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Air);
+				EraseTurretsInRadius(sp.X, sp.Y, _brushSize);
+				EraseMirrorsInRadius(sp.X, sp.Y, _brushSize);
+				break;
+			case BrushForce:     _sim.ApplyForce(sp.X, sp.Y, _brushSize * 3, 6); break;
 			case BrushDirt:      StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Dirt);      break;
 			case BrushGrassSeed: StampCircle(sp.X, sp.Y, (int)Simulation.Cell.GrassSeed); break;
 			case BrushTreeSeed:  StampCircle(sp.X, sp.Y, (int)Simulation.Cell.TreeSeed);  break;
@@ -861,7 +882,6 @@ public partial class Main : Control
 
 	private void ExecuteCommand(string raw)
 	{
-		_consoleInput.Clear();
 		string[] parts = raw.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
 		if (parts.Length == 0) return;
 
@@ -879,6 +899,10 @@ public partial class Main : Control
 				ConsoleLog("  [color=white]seedrate <0-1>[/color]    grass seed sprout chance per tick (default 0.003)");
 				ConsoleLog("  [color=white]treerate <0-1>[/color]    tree seed grow chance per tick (default 0.001)");
 				ConsoleLog("  [color=white]icethresh <n>[/color]     copper temp below which it freezes water (default 64)");
+				ConsoleLog("  [color=white]laserfalloff <0-1>[/color] laser power multiplier per bounce (0=instant, 1=no decay, default 0.4)");
+				ConsoleLog("  [color=white]lasermax <n>[/color]      max mirror bounces per beam (default 12)");
+				ConsoleLog("  [color=white]mirrordist <f>[/color]    mirror raw sample chord length in sim units (default 1.0)");
+				ConsoleLog("  [color=white]mirrorepsilon <f>[/color] mirror RDP simplification threshold in sim units (default 1.5)");
 				ConsoleLog("  [color=gray]Tab to autocomplete[/color]");
 				break;
 
@@ -904,6 +928,8 @@ public partial class Main : Control
 				foreach (var gl in _glorps) gl.QueueFree();
 				_glorps.Clear(); _selectedGlorp = null;
 				_turrets.Clear();
+				_mirrors.Clear(); _mirrorInProgress = null;
+				_sim.RenderDirty = true;
 				ConsoleLog("[color=cyan]Grid cleared.[/color]");
 				break;
 
@@ -942,52 +968,33 @@ public partial class Main : Control
 				ConsoleLog($"[color=cyan]Ice copper threshold → {_sim.IceCopperThreshold}[/color]");
 				break;
 
+			case "laserfalloff" when parts.Length > 1 && float.TryParse(parts[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float lf):
+				_laserFalloff = Math.Clamp(lf, 0f, 1f);
+				ConsoleLog($"[color=cyan]Laser falloff → {_laserFalloff:F2}[/color]");
+				break;
+
+			case "lasermax" when parts.Length > 1 && int.TryParse(parts[1], out int lm):
+				_laserMaxBounces = Math.Clamp(lm, 0, 64);
+				ConsoleLog($"[color=cyan]Laser max bounces → {_laserMaxBounces}[/color]");
+				break;
+
+			case "mirrordist" when parts.Length > 1 && float.TryParse(parts[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float md):
+				BezierMirror.RawMinDist = Math.Clamp(md, 0.2f, 20f);
+				ConsoleLog($"[color=cyan]Mirror sample dist → {BezierMirror.RawMinDist:F2}[/color]");
+				break;
+
+			case "mirrorepsilon" when parts.Length > 1 && float.TryParse(parts[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float me):
+				BezierMirror.RdpEpsilon = Math.Clamp(me, 0f, 30f);
+				ConsoleLog($"[color=cyan]Mirror RDP epsilon → {BezierMirror.RdpEpsilon:F2}[/color]");
+				break;
+
 			default:
 				ConsoleLog($"[color=red]Unknown command '{parts[0]}'. Type 'help'.[/color]");
 				break;
 		}
 	}
 
-	private void ConsoleLog(string bbcode) => _consoleOutput.AppendText("\n" + bbcode);
-
-	private static readonly string[] _consoleCommands = {
-		"help", "tps", "brush", "clear", "boil", "gasthresh",
-		"firerate", "fireticks", "seedrate", "treerate", "icethresh"
-	};
-
-	private void ConsoleAutocomplete()
-	{
-		string text = _consoleInput.Text;
-		if (text.Length == 0) return;
-		string word = text.Split(' ')[0].ToLower();
-		var matches = System.Array.FindAll(_consoleCommands, c => c.StartsWith(word));
-		if (matches.Length == 0) return;
-		if (matches.Length == 1)
-		{
-			_consoleInput.Text = matches[0] + " ";
-			_consoleInput.CaretColumn = _consoleInput.Text.Length;
-		}
-		else
-		{
-			string common = LongestCommonPrefix(matches);
-			if (common.Length > word.Length)
-			{
-				_consoleInput.Text = common;
-				_consoleInput.CaretColumn = common.Length;
-			}
-			ConsoleLog("[color=gray]" + string.Join("  ", matches) + "[/color]");
-		}
-	}
-
-	private static string LongestCommonPrefix(string[] strs)
-	{
-		if (strs.Length == 0) return "";
-		string prefix = strs[0];
-		for (int i = 1; i < strs.Length; i++)
-			while (!strs[i].StartsWith(prefix))
-				prefix = prefix[..^1];
-		return prefix;
-	}
+	// ConsoleLog is defined in Main.DebugGui.cs — routes to ImGui console tab
 
 	// ── Laser Turrets ──────────────────────────────────────────────────────────
 
@@ -1006,6 +1013,14 @@ public partial class Main : Control
 			t.Powered = t.CheckPowered(_sim);
 			t.UpdateAngle(_mouseSim);
 		}
+	}
+
+	private void EraseMirrorsInRadius(int cx, int cy, int radius)
+	{
+		float r = radius + 1f;
+		for (int i = _mirrors.Count - 1; i >= 0; i--)
+			if (_mirrors[i].IsNearCurve(cx, cy, r))
+				_mirrors.RemoveAt(i);
 	}
 
 	private void EraseTurretsInRadius(int cx, int cy, int radius)
@@ -1048,68 +1063,59 @@ public partial class Main : Control
 			float   segPower = 1.0f;
 			for (int w = 1; w < waypoints.Count; w++)
 			{
-				var   segEnd     = new Vector2(waypoints[w].X * Scale, waypoints[w].Y * Scale);
-				bool  postBounce = w > 1;
-				int   steps      = Math.Max(1, (int)((segEnd - prevScr).Length() / 8f));
+				var segEnd = new Vector2(waypoints[w].X * Scale, waypoints[w].Y * Scale);
+				int steps  = Math.Max(1, (int)((segEnd - prevScr).Length() / 8f));
 				for (int s = 0; s < steps; s++)
 				{
-					float frac = (s + 0.5f) / steps;
-					float a    = postBounce ? segPower * (1f - frac) : segPower;
-					var   p0   = prevScr.Lerp(segEnd, (float)s       / steps);
-					var   p1   = prevScr.Lerp(segEnd, (float)(s + 1) / steps);
-					c.DrawLine(p0, p1, new Color(1f, 0.2f,  0f,    0.20f * a), 6f);
-					c.DrawLine(p0, p1, new Color(1f, 0.45f, 0.1f,  0.85f * a), 2.5f);
-					c.DrawLine(p0, p1, new Color(1f, 0.9f,  0.85f, 0.95f * a), 1f);
+					var p0 = prevScr.Lerp(segEnd, (float)s       / steps);
+					var p1 = prevScr.Lerp(segEnd, (float)(s + 1) / steps);
+					c.DrawLine(p0, p1, new Color(1f, 0.2f,  0f,    0.20f * segPower), 6f);
+					c.DrawLine(p0, p1, new Color(1f, 0.45f, 0.1f,  0.85f * segPower), 2.5f);
+					c.DrawLine(p0, p1, new Color(1f, 0.9f,  0.85f, 0.95f * segPower), 1f);
 				}
-				segPower *= 0.4f;
+				segPower *= _laserFalloff;
 				prevScr   = segEnd;
 			}
 		}
 	}
 
-	private List<Vector2> CastLaserRay(Vector2 startSim, Vector2 dir, float maxRange, Vector2 turretOrigin)
+	private List<Vector2> CastLaserRay(Vector2 startSim, Vector2 dir, float segRange, Vector2 turretOrigin)
 	{
-		const int MaxBounces = 6;
 		var waypoints = new List<Vector2> { startSim };
 		Vector2 pos    = startSim;
 		Vector2 curDir = dir;
-		float remaining = maxRange;
 
-		for (int bounce = 0; bounce <= MaxBounces; bounce++)
+		for (int bounce = 0; bounce <= _laserMaxBounces; bounce++)
 		{
-			bool bounced = false;
-			float dist;
-			for (dist = 0.5f; dist < remaining; dist += 0.5f)
+			// Each segment gets a fresh range budget — exhaustion of one segment
+			// never prevents detection on the next.
+			float remaining = segRange;
+
+			// Find the closest Bezier mirror hit within this segment's budget
+			float   bestMirrorDist = float.MaxValue;
+			Vector2 bestMirrorNorm = default;
+			foreach (var m in _mirrors)
+			{
+				if (m.Intersect(pos, curDir, remaining, out float md, out Vector2 mn) && md < bestMirrorDist)
+				{ bestMirrorDist = md; bestMirrorNorm = mn; }
+			}
+			if (_mirrorInProgress is { } wip && wip.SamplePoints.Count >= 2)
+			{
+				if (wip.Intersect(pos, curDir, remaining, out float md, out Vector2 mn) && md < bestMirrorDist)
+				{ bestMirrorDist = md; bestMirrorNorm = mn; }
+			}
+
+			// March through the cell grid — stop before the mirror if one was found
+			float marchLimit = MathF.Min(bestMirrorDist - 0.3f, remaining);
+			for (float dist = 0.5f; dist <= marchLimit; dist += 0.5f)
 			{
 				Vector2 p  = pos + curDir * dist;
 				int gx = (int)p.X, gy = (int)p.Y;
 				if (!_sim.InBounds(gx, gy)) { waypoints.Add(p); return waypoints; }
-				int idx   = gy * SimW + gx;
-				byte cell = _sim.Grid[idx];
+				byte cell = _sim.Grid[gy * SimW + gx];
 				if (cell == (byte)Simulation.Cell.Air   ||
 					cell == (byte)Simulation.Cell.Gas   ||
 					cell == (byte)Simulation.Cell.Steam) continue;
-				if (cell == (byte)Simulation.Cell.Mirror)
-				{
-					waypoints.Add(p);
-					remaining -= dist;
-					pos = p;
-					// Quadrant relative to firing turret determines orientation:
-					// (gx > tx) != (gy > ty) → '\' : (dy, dx)
-					// (gx > tx) == (gy > ty) → '/' : (-dy,-dx)
-					bool isBackslash = (gx > turretOrigin.X) != (gy > turretOrigin.Y);
-					var reflected = isBackslash
-						? new Vector2( curDir.Y,  curDir.X)
-						: new Vector2(-curDir.Y, -curDir.X);
-					// Degenerate: beam parallel to mirror surface — flip to the other formula
-					if (reflected.X * curDir.X + reflected.Y * curDir.Y > 0.99f)
-						reflected = isBackslash
-							? new Vector2(-curDir.Y, -curDir.X)
-							: new Vector2( curDir.Y,  curDir.X);
-					curDir = reflected;
-					bounced = true;
-					break;
-				}
 				if (cell == (byte)Simulation.Cell.Sand  ||
 					cell == (byte)Simulation.Cell.Water ||
 					cell == (byte)Simulation.Cell.Food  ||
@@ -1121,9 +1127,21 @@ public partial class Main : Control
 				waypoints.Add(p);
 				return waypoints;
 			}
-			if (!bounced) { waypoints.Add(pos + curDir * remaining); return waypoints; }
+
+			if (bestMirrorDist <= remaining)
+			{
+				var hitPos = pos + curDir * bestMirrorDist;
+				waypoints.Add(hitPos);
+				pos    = hitPos;
+				curDir = (curDir - 2f * curDir.Dot(bestMirrorNorm) * bestMirrorNorm).Normalized();
+			}
+			else
+			{
+				waypoints.Add(pos + curDir * remaining);
+				return waypoints;
+			}
 		}
-		waypoints.Add(pos + curDir * Math.Max(0, remaining));
+		waypoints.Add(pos + curDir * segRange);
 		return waypoints;
 	}
 
@@ -1166,6 +1184,7 @@ public partial class Main : Control
 				sim.Pinned[idx] = 1;
 				t.OccupiedIndices.Add(idx);
 			}
+			sim.RenderDirty = true;
 			return t;
 		}
 
@@ -1194,9 +1213,220 @@ public partial class Main : Control
 				sim.Pinned[idx] = 0;
 				sim.Flow[idx]   = 0;
 			}
+			sim.RenderDirty = true;
 			OccupiedIndices.Clear();
 		}
 
 		public bool ContainsIndex(int idx) => OccupiedIndices.Contains(idx);
+	}
+
+	// ── BezierMirror ───────────────────────────────────────────────────────────
+	// A Catmull-Rom spline fitted live through the user's brush samples.
+	// Purely geometric — no grid cells. Intersection uses analytical Bezier
+	// tangent for normals; turret origin picks the facing side via dot product.
+
+	private sealed class BezierMirror
+	{
+		// Tunable via console — shared by all mirrors drawn after the change
+		public static float RawMinDist  = 1.0f;  // chord length between raw samples (sim units)
+		public static float RdpEpsilon  = 1.5f;  // RDP perpendicular-deviation threshold (sim units)
+
+		private const int IntersectSteps = 24;
+		private const int DrawSteps      = 16;
+
+		// Raw dense samples collected during the stroke
+		private readonly List<Vector2> _raw = new();
+
+		// RDP-simplified control points — spline is built from these
+		public readonly List<Vector2> SamplePoints = new();
+
+		private struct Seg { public Vector2 P0, P1, P2, P3; }
+		private readonly List<Seg> _segs = new();
+
+		public void AddSample(Vector2 p)
+		{
+			if (_raw.Count > 0 &&
+				(p - _raw[^1]).LengthSquared() < RawMinDist * RawMinDist)
+				return;
+			_raw.Add(p);
+
+			// Rebuild RDP-simplified control points (always includes first and last raw point)
+			SamplePoints.Clear();
+			SamplePoints.Add(_raw[0]);
+			if (_raw.Count > 1)
+				RdpRecurse(_raw, 0, _raw.Count - 1, RdpEpsilon * RdpEpsilon, SamplePoints);
+
+			if (SamplePoints.Count >= 2) Rebuild();
+		}
+
+		// Ramer–Douglas–Peucker — `lo` is already in `result`.
+		// This call adds indices lo+1 … hi with no duplicates.
+		private static void RdpRecurse(List<Vector2> pts, int lo, int hi,
+									   float epsSq, List<Vector2> result)
+		{
+			if (hi <= lo + 1) { result.Add(pts[hi]); return; }
+
+			var a = pts[lo]; var b = pts[hi];
+			var ab = b - a; float abLen2 = ab.LengthSquared();
+
+			float maxSq = 0f; int maxIdx = lo + 1;
+			for (int i = lo + 1; i < hi; i++)
+			{
+				float sq = abLen2 > 1e-12f
+					? PerpendicularDistSq(pts[i], a, ab, abLen2)
+					: (pts[i] - a).LengthSquared();
+				if (sq > maxSq) { maxSq = sq; maxIdx = i; }
+			}
+
+			if (maxSq > epsSq)
+			{
+				RdpRecurse(pts, lo,     maxIdx, epsSq, result); // adds lo+1 … maxIdx
+				RdpRecurse(pts, maxIdx, hi,     epsSq, result); // adds maxIdx+1 … hi
+			}
+			else
+			{
+				result.Add(pts[hi]); // interior collinear — skip it, keep endpoint
+			}
+		}
+
+		private static float PerpendicularDistSq(Vector2 p, Vector2 a, Vector2 ab, float abLen2)
+		{
+			float t = Math.Clamp(((p.X - a.X) * ab.X + (p.Y - a.Y) * ab.Y) / abLen2, 0f, 1f);
+			float ex = a.X + t * ab.X - p.X;
+			float ey = a.Y + t * ab.Y - p.Y;
+			return ex * ex + ey * ey;
+		}
+
+		// Chordal Catmull-Rom (α=1): tangents scale with local chord length.
+		// A short segment between two long ones can't produce an overshooting
+		// handle, which is what caused the self-intersection loops.
+		private void Rebuild()
+		{
+			_segs.Clear();
+			int n = SamplePoints.Count;
+			for (int i = 0; i < n - 1; i++)
+			{
+				// Reflection phantoms at chain ends → natural tangent (handle = chord/3)
+				var p0 = i > 0     ? SamplePoints[i - 1] : 2f * SamplePoints[i] - SamplePoints[i + 1];
+				var p1 = SamplePoints[i];
+				var p2 = SamplePoints[i + 1];
+				var p3 = i + 2 < n ? SamplePoints[i + 2] : 2f * SamplePoints[i + 1] - SamplePoints[i];
+
+				float d01 = (p1 - p0).Length();
+				float d12 = (p2 - p1).Length();
+				float d23 = (p3 - p2).Length();
+
+				if (d12 < 1e-6f) continue;
+
+				Vector2 b1 = d01 < 1e-6f
+					? p1 + (p2 - p1) / 3f
+					: p1 + ((p2 - p1) / d12 - (p2 - p0) / (d01 + d12) + (p1 - p0) / d01) * (d12 / 3f);
+
+				Vector2 b2 = d23 < 1e-6f
+					? p2 - (p2 - p1) / 3f
+					: p2 - ((p3 - p2) / d23 - (p3 - p1) / (d12 + d23) + (p2 - p1) / d12) * (d12 / 3f);
+
+				_segs.Add(new Seg { P0 = p1, P1 = b1, P2 = b2, P3 = p2 });
+			}
+		}
+
+		private static Vector2 Eval(in Seg s, float t)
+		{
+			float u  = 1f - t;
+			return u*u*u*s.P0 + 3f*u*u*t*s.P1 + 3f*u*t*t*s.P2 + t*t*t*s.P3;
+		}
+
+		// Analytical first derivative — gives the tangent direction at parameter t
+		private static Vector2 Tangent(in Seg s, float t)
+		{
+			float u = 1f - t;
+			return 3f * (u*u*(s.P1 - s.P0) + 2f*u*t*(s.P2 - s.P1) + t*t*(s.P3 - s.P2));
+		}
+
+		// Ray–Bezier intersection. Returns true with the ray distance and the
+		// surface normal pointing toward `origin` (the firing turret).
+		public bool Intersect(Vector2 origin, Vector2 dir, float maxDist,
+							  out float hitDist, out Vector2 normal)
+		{
+			hitDist = float.MaxValue;
+			normal  = default;
+
+			foreach (var seg in _segs)
+			{
+				Vector2 prev = Eval(seg, 0f);
+				for (int k = 1; k <= IntersectSteps; k++)
+				{
+					float   t   = k / (float)IntersectSteps;
+					Vector2 cur = Eval(seg, t);
+					var e = cur - prev;
+
+					// 2D ray–segment: origin + d*dir = prev + s*e
+					// denom = dir × e  (2D cross)
+					float denom = dir.X * e.Y - dir.Y * e.X;
+					if (MathF.Abs(denom) < 1e-6f) { prev = cur; continue; }
+
+					var   f = prev - origin;
+					float d = (f.X * e.Y - f.Y * e.X) / denom;  // distance along ray
+					float s = -(dir.X * f.Y - dir.Y * f.X) / denom; // fraction along edge
+
+					if (s < 0f || s > 1f || d < 0.3f || d >= maxDist) { prev = cur; continue; }
+
+					if (d < hitDist)
+					{
+						hitDist = d;
+						float hitT = Math.Clamp(((k - 1) + s) / IntersectSteps, 0.001f, 0.999f);
+
+						var tangent = Tangent(seg, hitT);
+						if (tangent.LengthSquared() < 1e-6f) tangent = e;
+
+						// Two candidate normals — pick the one facing the turret
+						var n1 = new Vector2(-tangent.Y,  tangent.X).Normalized();
+						var n2 = new Vector2( tangent.Y, -tangent.X).Normalized();
+						var toOrigin = origin - (prev + s * e);
+						normal = n1.Dot(toOrigin) >= 0f ? n1 : n2;
+					}
+					prev = cur;
+				}
+			}
+			return hitDist < maxDist;
+		}
+
+		public void Draw(OverlayCanvas c, Color col)
+		{
+			foreach (var seg in _segs)
+			{
+				Vector2 prev = Eval(seg, 0f);
+				for (int k = 1; k <= DrawSteps; k++)
+				{
+					var cur = Eval(seg, k / (float)DrawSteps);
+					c.DrawLine(prev * Scale, cur * Scale, col, 2f);
+					prev = cur;
+				}
+			}
+		}
+
+		// Proximity check against the fitted curve polyline (used for erase)
+		public bool IsNearCurve(float cx, float cy, float radius)
+		{
+			float r2 = radius * radius;
+			foreach (var seg in _segs)
+			{
+				Vector2 prev = Eval(seg, 0f);
+				for (int k = 1; k <= DrawSteps; k++)
+				{
+					var cur = Eval(seg, k / (float)DrawSteps);
+					// Closest point on line segment prev→cur to (cx,cy)
+					var  ab  = cur - prev;
+					float len2 = ab.LengthSquared();
+					float tx  = cx - prev.X, ty = cy - prev.Y;
+					float proj = len2 > 0f ? Math.Clamp((tx*ab.X + ty*ab.Y) / len2, 0f, 1f) : 0f;
+					float ex = prev.X + proj*ab.X - cx;
+					float ey = prev.Y + proj*ab.Y - cy;
+					if (ex*ex + ey*ey <= r2) return true;
+					prev = cur;
+				}
+			}
+			return false;
+		}
 	}
 }

@@ -4,30 +4,30 @@ using System.Collections.Generic;
 
 public partial class Glorp : Node2D
 {
-	private const int   BodyPx       = 48;   // display diameter in screen pixels
-	private const int   TexPx        = 12;   // texture resolution (upscaled 4x for pixel art look)
-	public  const float SimR         = 6f;   // collision radius in sim units (public for hit-test in Main)
-	private const float SenseRange      = 38f;
-	private const float EatRange        = 4f;
-	private const float TalkRange       = 22f;
-	private const int   Scale           = 4;
+	private const int   BodyPx = 48;
+	private const int   TexPx  = 12;
+	private const int   Scale  = 4;
+	public  const float SimR   = 6f;   // collision radius in sim units (public for hit-test in Main)
 
-	// Physics
-	private const float Gravity         = 130f;   // sim units / s²
-	private const float MaxFallSpeed    = 95f;    // sim units / s
-	private const float MaxHorizSpeed   = 32f;    // sim units / s
-	private const float HorizAccel      = 110f;   // sim units / s²
-	private const float GroundFriction  = 4f;     // exponential decay constant
-	private const float BounceRestitution = 0.18f;
-	private const float SquishDecay     = 3.5f;   // squish units lost per second
+	// Physics — public static so the debug panel can tune them at runtime
+	public static float SenseRange        = 38f;
+	public static float EatRange          = 4f;
+	public static float TalkRange         = 22f;
+	public static float Gravity           = 130f;   // sim units / s²
+	public static float MaxFallSpeed      = 95f;    // sim units / s
+	public static float MaxHorizSpeed     = 32f;    // sim units / s
+	public static float HorizAccel        = 110f;   // sim units / s²
+	public static float GroundFriction    = 4f;     // exponential decay constant
+	public static float BounceRestitution = 0.18f;
+	public static float SquishDecay       = 3.5f;   // squish units lost per second
 
-	private const float HungerRate   = 5f;
-	private const float ThirstRate   = 7f;
-	private const float LonelyRate   = 4f;
-	private const float HungerFill   = 55f;
-	private const float ThirstFill   = 45f;
-	private const float SocialGain   = 25f;
-	private const float BubbleLife   = 3.5f;
+	public static float HungerRate  = 5f;
+	public static float ThirstRate  = 7f;
+	public static float LonelyRate  = 4f;
+	public static float HungerFill  = 55f;
+	public static float ThirstFill  = 45f;
+	public static float SocialGain  = 25f;
+	public static float BubbleLife  = 3.5f;
 
 	public Vector2 SimPos;
 	public float Hunger   = 0f;

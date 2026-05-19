@@ -22,6 +22,9 @@ public partial class Simulation : RefCounted
 	public byte[]  Pinned;   // 1 = cell is pinned (never moves)
 	public float[] VelX;
 	public float[] VelY;
+	// Bumped whenever pixel-visible state may have changed. Main reads this to
+	// skip the full grid render on frames where nothing changed.
+	public bool RenderDirty = true;
 	public readonly List<(int cx, int cy, int radius)> PendingExplosions = new();
 	private byte[] _visited;
 	private bool   _flip;
@@ -31,6 +34,12 @@ public partial class Simulation : RefCounted
 	private readonly Queue<int> _coldQueue     = new Queue<int>(1024);
 	private byte[]   _hotDist;   // copper hops from nearest lava (255 = unreached)
 	private byte[]   _coldDist;  // copper hops from nearest LN2
+
+	// Velocity-cell physics — tunable at runtime
+	public float Gravity   = 0.45f;
+	public float Friction  = 0.99f;
+	public float DampCol   = 0.30f;
+	public float StopThr   = 0.30f;
 
 	public int   CopperBoilThreshold = 200; // 128=room, 255=lava-hot
 	public int   CopperGasThreshold  = 230;
@@ -75,6 +84,7 @@ public partial class Simulation : RefCounted
 		else
 			Flow[i] = 0;
 		VelX[i] = 0; VelY[i] = 0;
+		RenderDirty = true;
 	}
 
 	public void SetPinned(int x, int y, bool pin)
@@ -96,6 +106,7 @@ public partial class Simulation : RefCounted
 		}
 		PropagateElectricity();
 		PropagateHeat();
+		RenderDirty = true; // a tick can change anything — always re-render after
 	}
 
 	// ── Electricity ───────────────────────────────────────────────────────────
@@ -255,11 +266,11 @@ public partial class Simulation : RefCounted
 
 	private void UpdateVelocityCells()
 	{
-		const float gravity  = 0.45f;
-		const float friction = 0.99f;
-		const float dampCol  = 0.30f;
-		const float stopThr  = 0.30f;
-		const int   maxSteps = 8;
+		float gravity  = Gravity;
+		float friction = Friction;
+		float dampCol  = DampCol;
+		float stopThr  = StopThr;
+		const int maxSteps = 8;
 
 		int n = VelX.Length;
 		for (int i = 0; i < n; i++)
@@ -632,6 +643,7 @@ public partial class Simulation : RefCounted
 		Grid[i] = (byte)Cell.Fire;
 		Flow[i] = (byte)(FireBaseTicks + _rng.Next(FireBaseTicks));
 		VelX[i] = 0; VelY[i] = 0;
+		RenderDirty = true;
 	}
 
 	private void LavaIgnitesFlammables(int x, int y)
