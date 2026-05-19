@@ -31,6 +31,7 @@ public partial class Main : Control
 	private const int BrushTreeSeed  = (int)Simulation.Cell.TreeSeed;
 	private const int BrushFire           = -9;
 	private const int BrushLiquidNitrogen = (int)Simulation.Cell.LiquidNitrogen;
+	private const int BrushArm            = -10;
 
 	// ── Colours ───────────────────────────────────────────────────────────────
 
@@ -121,7 +122,7 @@ public partial class Main : Control
 	private Button _btnFood, _btnGlorp, _btnCopper, _btnBattery, _btnWood, _btnErase, _btnForce;
 	private Button _btnTabMaterials, _btnTabSettings, _btnTabAnalysis, _detachBtn;
 	private Button _btnHeatView, _btnPin, _btnTurret, _btnMirror;
-	private Button _btnDirt, _btnGrassSeed, _btnTreeSeed, _btnFire, _btnLiquidNitrogen;
+	private Button _btnDirt, _btnGrassSeed, _btnTreeSeed, _btnFire, _btnLiquidNitrogen, _btnArm;
 	private Control _materialsPage, _settingsPage, _analysisPage;
 	private Label   _heatResultLabel;
 	private HSlider _slider, _speedSlider;
@@ -160,6 +161,22 @@ public partial class Main : Control
 	// Bezier mirrors
 	private readonly List<BezierMirror> _mirrors = new();
 	private BezierMirror _mirrorInProgress;
+
+	// Robotic arms
+	private readonly List<RoboArm> _arms = new();
+	private RoboArm _activeArm;                   // most recently dragged — receives Space toggle
+	private (RoboArm arm, int joint)? _armDrag;   // joint: 0 = elbow, 1 = claw
+	private int _pincerHalfWidth = 1;             // 0=1cell, 1=3cell, 2=5cell, …
+	private int _pincerDepth    = 1;             // rows grabbed along the forearm (1=single row)
+	// Default whitelist: every cell type that can be picked up/moved in the sim
+	private readonly HashSet<byte> _clawWhitelist = new()
+	{
+		(byte)Simulation.Cell.Sand,    (byte)Simulation.Cell.Water,   (byte)Simulation.Cell.Lava,
+		(byte)Simulation.Cell.Gas,     (byte)Simulation.Cell.Food,    (byte)Simulation.Cell.Dirt,
+		(byte)Simulation.Cell.Fire,    (byte)Simulation.Cell.Smoke,   (byte)Simulation.Cell.Steam,
+		(byte)Simulation.Cell.LiquidNitrogen, (byte)Simulation.Cell.NitrogenGas,
+		(byte)Simulation.Cell.GrassSeed, (byte)Simulation.Cell.TreeSeed,
+	};
 
 	// Heat viewer
 	private Vector2I _heatStart, _heatEnd;
@@ -218,6 +235,7 @@ public partial class Main : Control
 		_btnTreeSeed  = GetNode<Button>(g + "BtnTreeSeed");
 		_btnFire            = GetNode<Button>(g + "BtnFire");
 		_btnLiquidNitrogen  = GetNode<Button>(g + "BtnLiquidNitrogen");
+		_btnArm             = GetNode<Button>(g + "BtnArm");
 
 		_slider      = GetNode<HSlider>("UI/ToolBox/Panel/VBoxContainer/MaterialsPage/SizeSlider");
 		_speedSlider = GetNode<HSlider>("UI/ToolBox/Panel/VBoxContainer/SettingsPage/SpeedSlider");
@@ -255,6 +273,7 @@ public partial class Main : Control
 		_btnTreeSeed.Pressed  += () => SetBrush(BrushTreeSeed);
 		_btnFire.Pressed           += () => SetBrush(BrushFire);
 		_btnLiquidNitrogen.Pressed += () => SetBrush(BrushLiquidNitrogen);
+		_btnArm.Pressed            += () => SetBrush(BrushArm);
 		_slider.ValueChanged      += v => _brushSize      = (int)v;
 		_speedSlider.ValueChanged += v => _ticksPerSecond = (int)v;
 
@@ -308,6 +327,7 @@ public partial class Main : Control
 		Vector2 mouse = GetViewport().GetMousePosition();
 		_mouseSim = ScreenToSim(mouse);
 		UpdateTurrets();
+		UpdateArms();
 
 		// ImGui must be submitted every frame — do this before any early returns
 		DrawDebugGui();
@@ -329,6 +349,13 @@ public partial class Main : Control
 
 		bool lmbHeld = Input.IsMouseButtonPressed(MouseButton.Left);
 		bool rmbHeld = Input.IsMouseButtonPressed(MouseButton.Right);
+
+		// Arm joint drag overrides all brush behavior while held
+		if (lmbHeld && _armDrag != null)
+		{
+			UpdateArmDrag(ScreenToSimF(mouse));
+			return;
+		}
 
 		if (lmbHeld)
 		{
@@ -361,6 +388,7 @@ public partial class Main : Control
 				StampCircle(simPos.X, simPos.Y, (int)Simulation.Cell.Air);
 				EraseTurretsInRadius(simPos.X, simPos.Y, _brushSize);
 				EraseMirrorsInRadius(simPos.X, simPos.Y, _brushSize);
+				EraseArmsInRadius(simPos.X, simPos.Y, _brushSize);
 			}
 		}
 	}
@@ -369,13 +397,20 @@ public partial class Main : Control
 
 	public override void _Input(InputEvent @event)
 	{
-		// Debug panel toggle
+		// Debug panel toggle + arm claw toggle
 		if (@event is InputEventKey k && k.Pressed && !k.Echo)
 		{
 			if (k.Keycode == Key.Quoteleft)
 			{
 				_showDebugGui = !_showDebugGui;
 				_debugWinGeomLoaded = false; // re-apply saved position on next open
+				GetViewport().SetInputAsHandled();
+				return;
+			}
+			// Yield Space to ImGui when a text input is focused (e.g. console tab).
+		if (k.Keycode == Key.Space && !ImGuiNET.ImGui.GetIO().WantCaptureKeyboard)
+			{
+				ToggleActiveArmClaw();
 				GetViewport().SetInputAsHandled();
 				return;
 			}
@@ -417,6 +452,20 @@ public partial class Main : Control
 			{
 				if (mb.ButtonIndex == MouseButton.Left)
 				{
+					// Arm-joint drag takes priority over every brush — clicking near
+					// any elbow or claw grabs that joint regardless of current tool.
+					if (!overUI)
+					{
+						var hit = FindClosestJoint(ScreenToSimF(mouse));
+						if (hit != null)
+						{
+							_armDrag   = hit;
+							_activeArm = hit.Value.arm;
+							GetViewport().SetInputAsHandled();
+							return;
+						}
+					}
+
 					if (_brush == BrushHeatView && !overUI)
 					{
 						_selectingHeat  = true;
@@ -438,6 +487,10 @@ public partial class Main : Control
 					else if (_brush == BrushTurret && !overUI)
 					{
 						PlaceTurret(ScreenToSim(mouse));
+					}
+					else if (_brush == BrushArm && !overUI)
+					{
+						PlaceArm(ScreenToSim(mouse));
 					}
 					else if (_brush == BrushMirror && !overUI)
 					{
@@ -461,7 +514,11 @@ public partial class Main : Control
 			{
 				if (mb.ButtonIndex == MouseButton.Left)
 				{
-					if (_brush == BrushHeatView && _selectingHeat)
+					if (_armDrag != null)
+					{
+						_armDrag = null;
+					}
+					else if (_brush == BrushHeatView && _selectingHeat)
 					{
 						_selectingHeat = false;
 						_hasHeatResult = true;
@@ -700,6 +757,7 @@ public partial class Main : Control
 			m.Draw(c, mirrorCol);
 		_mirrorInProgress?.Draw(c, mirrorColWip);
 		DrawTurrets(c);
+		DrawArms(c);
 		// Shockwave rings
 		foreach (var sw in _shockwaves)
 		{
@@ -751,6 +809,32 @@ public partial class Main : Control
 			case BrushGlorp:
 				c.DrawArc(center, Glorp.SimR * Scale, 0, MathF.PI * 2f, 48, col, lw);
 				break;
+
+			case BrushArm:
+			{
+				// Outline of the 3×3 base + 2 single-cell terminals on the middle row
+				float s  = Scale;
+				float ox = _mouseSim.X * s;
+				float oy = _mouseSim.Y * s;
+				var pts = new Vector2[]
+				{
+					new(ox - 1*s, oy - 1*s),
+					new(ox + 2*s, oy - 1*s),
+					new(ox + 2*s, oy        ),
+					new(ox + 3*s, oy        ),
+					new(ox + 3*s, oy +   s),
+					new(ox + 2*s, oy +   s),
+					new(ox + 2*s, oy + 2*s),
+					new(ox - 1*s, oy + 2*s),
+					new(ox - 1*s, oy +   s),
+					new(ox - 2*s, oy +   s),
+					new(ox - 2*s, oy        ),
+					new(ox - 1*s, oy        ),
+					new(ox - 1*s, oy - 1*s),  // close
+				};
+				c.DrawPolyline(pts, col, lw);
+				break;
+			}
 
 			case BrushForce:
 				// Force radius is brushSize * 3 (matches ApplyForce call)
@@ -811,6 +895,7 @@ public partial class Main : Control
 		_btnTreeSeed.Modulate  = b == BrushTreeSeed  ? Colors.Yellow : Colors.White;
 		_btnFire.Modulate           = b == BrushFire           ? Colors.Yellow : Colors.White;
 		_btnLiquidNitrogen.Modulate = b == BrushLiquidNitrogen ? Colors.Yellow : Colors.White;
+		_btnArm.Modulate            = b == BrushArm            ? Colors.Yellow : Colors.White;
 	}
 
 	private void SetActiveTab(int tab)
@@ -894,6 +979,7 @@ public partial class Main : Control
 				StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Air);
 				EraseTurretsInRadius(sp.X, sp.Y, _brushSize);
 				EraseMirrorsInRadius(sp.X, sp.Y, _brushSize);
+				EraseArmsInRadius(sp.X, sp.Y, _brushSize);
 				break;
 			case BrushForce:     _sim.ApplyForce(sp.X, sp.Y, _brushSize * 3, 6); break;
 			case BrushDirt:      StampCircle(sp.X, sp.Y, (int)Simulation.Cell.Dirt);      break;
@@ -970,6 +1056,9 @@ public partial class Main : Control
 				ConsoleLog("  [color=white]lasermax <n>[/color]      max mirror bounces per beam (default 12)");
 				ConsoleLog("  [color=white]mirrordist <f>[/color]    mirror raw sample chord length in sim units (default 1.0)");
 				ConsoleLog("  [color=white]mirrorepsilon <f>[/color] mirror RDP simplification threshold in sim units (default 1.5)");
+				ConsoleLog("  [color=white]clawadd <type>[/color]    add cell type to claw whitelist");
+				ConsoleLog("  [color=white]clawremove <type>[/color] remove cell type from claw whitelist");
+				ConsoleLog("  [color=white]clawlist[/color]          print current claw whitelist");
 				ConsoleLog("  [color=gray]Tab to autocomplete[/color]");
 				break;
 
@@ -996,6 +1085,7 @@ public partial class Main : Control
 				_glorps.Clear(); _selectedGlorp = null;
 				_turrets.Clear();
 				_mirrors.Clear(); _mirrorInProgress = null;
+				_arms.Clear(); _activeArm = null; _armDrag = null;
 				_sim.RenderDirty = true;
 				ConsoleLog("[color=cyan]Grid cleared.[/color]");
 				break;
@@ -1055,6 +1145,23 @@ public partial class Main : Control
 				ConsoleLog($"[color=cyan]Mirror RDP epsilon → {BezierMirror.RdpEpsilon:F2}[/color]");
 				break;
 
+			case "clawadd" when parts.Length > 1 && Enum.TryParse<Simulation.Cell>(parts[1], true, out var addType):
+				_clawWhitelist.Add((byte)addType);
+				ConsoleLog($"[color=cyan]Claw can now pick up {addType}[/color]");
+				break;
+
+			case "clawremove" when parts.Length > 1 && Enum.TryParse<Simulation.Cell>(parts[1], true, out var remType):
+				_clawWhitelist.Remove((byte)remType);
+				ConsoleLog($"[color=cyan]Claw can no longer pick up {remType}[/color]");
+				break;
+
+			case "clawlist":
+				var names = new List<string>();
+				foreach (byte b in _clawWhitelist) names.Add(((Simulation.Cell)b).ToString());
+				names.Sort();
+				ConsoleLog($"[color=cyan]Claw whitelist:[/color] {string.Join(", ", names)}");
+				break;
+
 			default:
 				ConsoleLog($"[color=red]Unknown command '{parts[0]}'. Type 'help'.[/color]");
 				break;
@@ -1105,6 +1212,220 @@ public partial class Main : Control
 			if (!hit) continue;
 			t.Remove(_sim);
 			_turrets.RemoveAt(i);
+		}
+	}
+
+	// ── Robotic arm ────────────────────────────────────────────────────────────
+
+	private void PlaceArm(Vector2I origin)
+	{
+		// Check the 3×3 base + 2 terminal cells are all in-bounds
+		for (int dy = -RoboArm.BaseHalfW; dy <= RoboArm.BaseHalfW; dy++)
+		for (int dx = -RoboArm.BaseHalfW; dx <= RoboArm.BaseHalfW; dx++)
+			if (!_sim.InBounds(origin.X + dx, origin.Y + dy)) return;
+
+		var arm = RoboArm.Place(_sim, origin);
+		_arms.Add(arm);
+		_activeArm = arm; // newly placed arm becomes active
+	}
+
+	private void EraseArmsInRadius(int cx, int cy, int radius)
+	{
+		for (int i = _arms.Count - 1; i >= 0; i--)
+		{
+			var a = _arms[i];
+			bool hit = false;
+			for (int dy = -radius; dy <= radius && !hit; dy++)
+			for (int dx = -radius; dx <= radius && !hit; dx++)
+			{
+				if (dx * dx + dy * dy > radius * radius) continue;
+				if (a.ContainsIndex((cy + dy) * SimW + (cx + dx))) hit = true;
+			}
+			if (!hit) continue;
+			a.Remove(_sim);
+			if (_activeArm == a) _activeArm = null;
+			_arms.RemoveAt(i);
+		}
+	}
+
+	// Returns the closest grabbable joint within JointGrabRadius of `simPos`.
+	// joint: 0 = elbow, 1 = claw. Returns null if nothing in range.
+	private (RoboArm arm, int joint)? FindClosestJoint(Vector2 simPos)
+	{
+		float bestDistSq = RoboArm.JointGrabRadius * RoboArm.JointGrabRadius;
+		(RoboArm arm, int joint)? best = null;
+		foreach (var a in _arms)
+		{
+			float d0 = (a.Elbow - simPos).LengthSquared();
+			if (d0 < bestDistSq) { bestDistSq = d0; best = (a, 0); }
+			float d1 = (a.Claw - simPos).LengthSquared();
+			if (d1 < bestDistSq) { bestDistSq = d1; best = (a, 1); }
+		}
+		return best;
+	}
+
+	// Drive the currently-dragged joint toward the mouse, respecting collision.
+	private void UpdateArmDrag(Vector2 mouseSimF)
+	{
+		if (_armDrag is not { } d) return;
+		var arm = d.arm;
+		if (!arm.Powered) return; // unpowered = frozen
+
+		if (d.joint == 0)
+		{
+			// Dragging elbow → set shoulder angle so the upper arm points at the mouse.
+			// Both segments must clear blockers (forearm comes along for the ride).
+			float target = MathF.Atan2(mouseSimF.Y - arm.Shoulder.Y, mouseSimF.X - arm.Shoulder.X);
+			float prev   = arm.ShoulderAngle;
+			arm.ShoulderAngle = target;
+			if (ArmSegmentBlocked(arm.Shoulder, arm.Elbow, RoboArm.ShoulderSkip) ||
+				ArmSegmentBlocked(arm.Elbow,    arm.Claw,  0f))
+				arm.ShoulderAngle = prev;
+			else
+				_sim.RenderDirty = true;
+		}
+		else
+		{
+			// Dragging claw → set forearm angle so the forearm points at the mouse.
+			float target = MathF.Atan2(mouseSimF.Y - arm.Elbow.Y, mouseSimF.X - arm.Elbow.X);
+			float prev   = arm.ElbowAngle;
+			arm.ElbowAngle = target;
+			if (ArmSegmentBlocked(arm.Elbow, arm.Claw, 0f))
+				arm.ElbowAngle = prev;
+			else
+				_sim.RenderDirty = true;
+		}
+	}
+
+	private void UpdateArms()
+	{
+		foreach (var a in _arms)
+			a.Powered = a.CheckPowered(_sim);
+	}
+
+	// Toggle the active arm's claw. Closing grabs whitelisted cells in the
+	// pincer area into the arm's Held list. Opening releases them as ballistic
+	// cells (downward velocity) — the velocity-cell physics handles the rest.
+	private void ToggleActiveArmClaw()
+	{
+		if (_activeArm == null || !_activeArm.Powered) return;
+		var arm = _activeArm;
+
+		if (!arm.ClawClosed)
+		{
+			// Closing — grab matching cells at the current pincer size
+			int hw    = _pincerHalfWidth;
+			int depth = _pincerDepth;
+			int n     = RoboArm.PincerCellCount(hw, depth);
+			Span<Vector2I> pincer = stackalloc Vector2I[RoboArm.PincerCellCount(RoboArm.MaxPincerHalfWidth, RoboArm.MaxPincerDepth)];
+			arm.GetPincerCells(hw, depth, pincer[..n]);
+			arm.HeldHalfWidth = hw;
+			arm.HeldDepth     = depth;
+			arm.Held.Clear();
+			for (int i = 0; i < n; i++)
+			{
+				var p = pincer[i];
+				if (!_sim.InBounds(p.X, p.Y)) { arm.Held.Add((0, 0)); continue; }
+				int idx = p.Y * SimW + p.X;
+				byte c = _sim.Grid[idx];
+				if (_clawWhitelist.Contains(c) && _sim.Pinned[idx] == 0)
+				{
+					arm.Held.Add((c, _sim.Flow[idx]));
+					_sim.SetCell(p.X, p.Y, (int)Simulation.Cell.Air);
+				}
+				else
+				{
+					arm.Held.Add((0, 0));
+				}
+			}
+			arm.ClawClosed = true;
+		}
+		else
+		{
+			// Opening — release held cells using the hw/depth recorded at grab time
+			int n     = arm.Held.Count;
+			int hw    = arm.HeldHalfWidth;
+			int depth = arm.HeldDepth;
+			Span<Vector2I> pincer = stackalloc Vector2I[RoboArm.PincerCellCount(RoboArm.MaxPincerHalfWidth, RoboArm.MaxPincerDepth)];
+			arm.GetPincerCells(hw, depth, pincer[..n]);
+			for (int i = 0; i < n; i++)
+			{
+				var (cell, flow) = arm.Held[i];
+				if (cell == 0) continue;
+				var p = pincer[i];
+				if (!_sim.InBounds(p.X, p.Y)) continue;
+				int idx = p.Y * SimW + p.X;
+				if (_sim.Grid[idx] != (byte)Simulation.Cell.Air) continue;
+				_sim.SetCell(p.X, p.Y, cell);
+				_sim.Flow[idx] = flow;
+				_sim.VelY[idx] = 1.0f;
+			}
+			arm.Held.Clear();
+			arm.ClawClosed = false;
+		}
+		_sim.RenderDirty = true;
+	}
+
+	private void DrawArms(OverlayCanvas c)
+	{
+		Span<Vector2I> pincer = stackalloc Vector2I[RoboArm.PincerCellCount(RoboArm.MaxPincerHalfWidth, RoboArm.MaxPincerDepth)];
+		foreach (var a in _arms)
+		{
+			float alpha = a.Powered ? 1.0f : 0.5f;
+			var bodyCol  = new Color(0.62f, 0.66f, 0.72f, alpha);
+			var jointCol = new Color(0.80f, 0.85f, 0.90f, alpha);
+			var activeCol = new Color(1.00f, 0.90f, 0.40f, alpha);
+
+			Vector2 sh = a.Shoulder * Scale;
+			Vector2 el = a.Elbow    * Scale;
+			Vector2 cl = a.Claw     * Scale;
+
+			c.DrawLine(sh, el, bodyCol, 3.0f);
+			c.DrawLine(el, cl, bodyCol, 3.0f);
+
+			// Joints — active arm gets a slight highlight on its joints
+			var pivotCol = a == _activeArm ? activeCol : jointCol;
+			c.DrawCircle(sh, 3.5f, pivotCol);
+			c.DrawCircle(el, 3.0f, pivotCol);
+
+			// Pincer indicator: closed = thin tip line; open = rectangle showing grab zone.
+			Vector2 perpScr = a.PincerPerp * Scale;
+			Vector2 fwdScr  = new Vector2(MathF.Cos(a.ElbowAngle), MathF.Sin(a.ElbowAngle)) * Scale;
+			if (a.ClawClosed)
+			{
+				c.DrawLine(cl + perpScr * 0.4f, cl - perpScr * 0.4f, pivotCol, 2.5f);
+			}
+			else
+			{
+				float hw  = _pincerHalfWidth + 0.5f;
+				float dep = _pincerDepth - 0.5f;
+				Vector2 tipL  = cl + perpScr * hw;
+				Vector2 tipR  = cl - perpScr * hw;
+				Vector2 bakL  = cl + perpScr * hw + fwdScr * dep;
+				Vector2 bakR  = cl - perpScr * hw + fwdScr * dep;
+				c.DrawLine(tipL, tipR, pivotCol, 2.0f);
+				c.DrawLine(bakL, bakR, pivotCol, 2.0f);
+				c.DrawLine(tipL, bakL, pivotCol, 2.0f);
+				c.DrawLine(tipR, bakR, pivotCol, 2.0f);
+			}
+
+			// Held cells render at their grabbed positions
+			if (a.ClawClosed && a.Held.Count > 0)
+			{
+				int n     = a.Held.Count;
+				int hw    = a.HeldHalfWidth;
+				int depth = a.HeldDepth;
+				a.GetPincerCells(hw, depth, pincer[..n]);
+				for (int i = 0; i < n; i++)
+				{
+					var (cell, flow) = a.Held[i];
+					if (cell == 0) continue;
+					CellColor(cell, flow, out byte r, out byte g, out byte b);
+					var col = new Color(r / 255f, g / 255f, b / 255f, alpha);
+					var p = pincer[i];
+					c.DrawRect(new Rect2(p.X * Scale, p.Y * Scale, Scale, Scale), col, true);
+				}
+			}
 		}
 	}
 
@@ -1285,6 +1606,160 @@ public partial class Main : Control
 		}
 
 		public bool ContainsIndex(int idx) => OccupiedIndices.Contains(idx);
+	}
+
+	// ── RoboArm ────────────────────────────────────────────────────────────────
+	// Two-segment robotic arm. Base is a 3×3 pinned Stone block with two copper
+	// terminals one cell outside the middle row (same wiring pattern as turret).
+	// Segments are overlay-only — no cells stamped while the arm swings.
+	// Joint angles are absolute world-space radians so future scripting just sets
+	// floats. The claw is a 3-cell pincer perpendicular to the forearm.
+
+	private sealed class RoboArm
+	{
+		public const int   BaseHalfW        = 1;     // 3×3 base
+		public const float UpperArmLen      = 12f;
+		public const float ForearmLen       = 12f;
+		public const float JointGrabRadius  = 3.0f;  // sim units — how close to click to grab a joint
+		public const float ShoulderSkip     = 2.0f;  // skip the first 2 units of upper arm (inside our own base)
+
+		public Vector2I Origin;
+		public float    ShoulderAngle = -MathF.PI / 2f;
+		public float    ElbowAngle    = -MathF.PI / 2f;
+		public bool     ClawClosed;
+		public bool     Powered;
+		public readonly List<(byte cell, byte flow)> Held = new();
+		public readonly List<int> OccupiedIndices = new();
+
+		public Vector2 Shoulder => new(Origin.X + 0.5f, Origin.Y + 0.5f);
+		public Vector2 Elbow    => Shoulder + new Vector2(MathF.Cos(ShoulderAngle), MathF.Sin(ShoulderAngle)) * UpperArmLen;
+		public Vector2 Claw     => Elbow    + new Vector2(MathF.Cos(ElbowAngle),    MathF.Sin(ElbowAngle))    * ForearmLen;
+
+		// Perpendicular to forearm direction, used to compute pincer cell positions
+		public Vector2 PincerPerp => new(-MathF.Sin(ElbowAngle), MathF.Cos(ElbowAngle));
+
+		// The cells the pincer occupies: 2*halfWidth+1 cells along the line perpendicular
+		// to the forearm, centered at the claw tip. halfWidth=0 → 1 cell at the tip only.
+		// halfWidth=1 → 3 cells (one on each side of the tip). Etc.
+		public const int MaxPincerHalfWidth = 6;
+		public const int MaxPincerDepth    = 8;
+		public static int PincerCellCount(int halfWidth, int depth) => (2 * halfWidth + 1) * depth;
+
+		// hw × depth stored at grab time so release can reconstruct positions correctly
+		public int HeldHalfWidth;
+		public int HeldDepth = 1;
+
+		// Fills outCells row-major: d=0 is at claw tip, d=1..depth-1 extend forward past the tip.
+		public void GetPincerCells(int halfWidth, int depth, Span<Vector2I> outCells)
+		{
+			var c    = Claw;
+			var perp = PincerPerp;
+			float fwdX = MathF.Cos(ElbowAngle);
+			float fwdY = MathF.Sin(ElbowAngle);
+			int width  = 2 * halfWidth + 1;
+			for (int d = 0; d < depth; d++)
+			{
+				float rx = c.X + fwdX * d;
+				float ry = c.Y + fwdY * d;
+				for (int w = -halfWidth; w <= halfWidth; w++)
+				{
+					outCells[d * width + (w + halfWidth)] = new Vector2I(
+						(int)MathF.Floor(rx + perp.X * w),
+						(int)MathF.Floor(ry + perp.Y * w));
+				}
+			}
+		}
+
+		public static RoboArm Place(Simulation sim, Vector2I origin)
+		{
+			var a = new RoboArm { Origin = origin };
+			for (int dy = -BaseHalfW; dy <= BaseHalfW; dy++)
+			for (int dx = -BaseHalfW; dx <= BaseHalfW; dx++)
+			{
+				int gx = origin.X + dx, gy = origin.Y + dy;
+				if (!sim.InBounds(gx, gy)) continue;
+				int idx = gy * Simulation.SimW + gx;
+				sim.Grid[idx]   = (byte)Simulation.Cell.Stone;
+				sim.Flow[idx]   = 0;
+				sim.Pinned[idx] = 1;
+				a.OccupiedIndices.Add(idx);
+			}
+			// Copper terminals at middle row, 1 cell outside the base
+			int termY = origin.Y;
+			foreach (int termX in new[] { origin.X - BaseHalfW - 1, origin.X + BaseHalfW + 1 })
+			{
+				if (!sim.InBounds(termX, termY)) continue;
+				int idx = termY * Simulation.SimW + termX;
+				sim.Grid[idx]   = (byte)Simulation.Cell.Copper;
+				sim.Flow[idx]   = 0;
+				sim.Pinned[idx] = 1;
+				a.OccupiedIndices.Add(idx);
+			}
+			sim.RenderDirty = true;
+			return a;
+		}
+
+		public bool CheckPowered(Simulation sim)
+		{
+			int termY  = Origin.Y;
+			int leftX  = Origin.X - BaseHalfW - 1;
+			int rightX = Origin.X + BaseHalfW + 1;
+			return (sim.InBounds(leftX,  termY) && sim.Electric[termY * Simulation.SimW + leftX]  != 0)
+				|| (sim.InBounds(rightX, termY) && sim.Electric[termY * Simulation.SimW + rightX] != 0);
+		}
+
+		public void Remove(Simulation sim)
+		{
+			foreach (int idx in OccupiedIndices)
+			{
+				sim.Grid[idx]   = (byte)Simulation.Cell.Air;
+				sim.Pinned[idx] = 0;
+				sim.Flow[idx]   = 0;
+			}
+			OccupiedIndices.Clear();
+			sim.RenderDirty = true;
+		}
+
+		public bool ContainsIndex(int idx) => OccupiedIndices.Contains(idx);
+	}
+
+	// Cells that block arm body movement. Pinned cells of any type also block.
+	// Electrified copper and batteries pass through so wired circuits don't cage the arm.
+	private static bool IsArmBlocker(Simulation sim, int gx, int gy)
+	{
+		int idx = gy * Simulation.SimW + gx;
+		if (sim.Pinned[idx] != 0) return true;
+		byte c = sim.Grid[idx];
+		// Powered copper is intentionally passable — the arm is designed to operate inside circuits.
+		bool electrifiedCopper = c == (byte)Simulation.Cell.Copper && sim.Electric[idx] != 0;
+		return !electrifiedCopper && (
+			   c == (byte)Simulation.Cell.Stone
+			|| c == (byte)Simulation.Cell.Copper
+			|| c == (byte)Simulation.Cell.Wood
+			|| c == (byte)Simulation.Cell.Bark
+			|| c == (byte)Simulation.Cell.Mirror
+			|| c == (byte)Simulation.Cell.Ice
+			|| c == (byte)Simulation.Cell.Leaves);
+	}
+
+	// Tests if the line segment from `a` to `b` (sim coords) passes through any
+	// blocker cell. `skipStart` lets us ignore the first portion (the arm's own base).
+	private bool ArmSegmentBlocked(Vector2 a, Vector2 b, float skipStart)
+	{
+		var dir = b - a;
+		float len = dir.Length();
+		if (len < 1e-6f) return false;
+		float startT = MathF.Min(skipStart / len, 1f);
+		int steps = Math.Max(1, (int)MathF.Ceiling((len - skipStart) * 2f));
+		for (int i = 0; i <= steps; i++)
+		{
+			float t = startT + (1f - startT) * (i / (float)steps);
+			var p = a + dir * t;
+			int gx = (int)MathF.Floor(p.X), gy = (int)MathF.Floor(p.Y);
+			if (gx < 0 || gx >= SimW || gy < 0 || gy >= SimH) return true;
+			if (IsArmBlocker(_sim, gx, gy)) return true;
+		}
+		return false;
 	}
 
 	// ── BezierMirror ───────────────────────────────────────────────────────────

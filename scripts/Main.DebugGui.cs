@@ -42,6 +42,7 @@ public partial class Main
 			DrawFirePlantsTab();
 			DrawLaserTab();
 			DrawMirrorsTab();
+			DrawArmTab();
 			DrawGlorpTab();
 			DrawConsoleTab();
 			ImGui.EndTabBar();
@@ -177,6 +178,44 @@ public partial class Main
 		float md = BezierMirror.RawMinDist;
 		if (ImGui.SliderFloat("Sample Dist", ref md, 0.2f, 10f, "%.2f")) BezierMirror.RawMinDist = md;
 		ImGui.SetItemTooltip("Minimum chord distance between raw mouse samples (sim units) — sets base resolution of the drawn mirror");
+
+		ImGui.EndTabItem();
+	}
+
+	private void DrawArmTab()
+	{
+		if (!ImGui.BeginTabItem("Arm")) return;
+
+		ImGui.SeparatorText("Claw");
+
+		int hw = _pincerHalfWidth;
+		if (ImGui.SliderInt("Pincer Half-Width", ref hw, 0, RoboArm.MaxPincerHalfWidth))
+			_pincerHalfWidth = hw;
+		ImGui.SetItemTooltip(
+			$"Cells grabbed perpendicular to the forearm: {2 * _pincerHalfWidth + 1}.\n" +
+			"0 = single cell. 1 = 3-wide. 2 = 5-wide. Etc.\n" +
+			"Applies to the next grab — held cells keep their size until released.");
+
+		int dep = _pincerDepth;
+		if (ImGui.SliderInt("Pincer Depth", ref dep, 1, RoboArm.MaxPincerDepth))
+			_pincerDepth = dep;
+		ImGui.SetItemTooltip(
+			$"Rows grabbed along the forearm: {_pincerDepth}.\n" +
+			"1 = single row at claw tip. Higher values grab a rectangular block\n" +
+			"extending back toward the elbow.");
+
+		ImGui.Text($"Total cells per grab: {(2 * _pincerHalfWidth + 1) * _pincerDepth}  ({2 * _pincerHalfWidth + 1} wide × {_pincerDepth} deep)");
+
+		ImGui.SeparatorText("State");
+		ImGui.Text($"Arms in world: {_arms.Count}");
+		if (_activeArm != null)
+		{
+			ImGui.Text($"Active arm — powered: {_activeArm.Powered}, claw: {(_activeArm.ClawClosed ? "closed" : "open")}, holding: {_activeArm.Held.Count} cells");
+		}
+		else
+		{
+			ImGui.TextDisabled("No active arm (drag a joint to activate one).");
+		}
 
 		ImGui.EndTabItem();
 	}
@@ -354,6 +393,10 @@ public partial class Main
 		cfg.SetValue("Mirrors", "rdpEpsilon",  BezierMirror.RdpEpsilon);
 		cfg.SetValue("Mirrors", "rawMinDist",  BezierMirror.RawMinDist);
 
+		// Arm
+		cfg.SetValue("Arm", "pincerHalfWidth", _pincerHalfWidth);
+		cfg.SetValue("Arm", "pincerDepth",     _pincerDepth);
+
 		// Glorp
 		cfg.SetValue("Glorp", "gravity",           Glorp.Gravity);
 		cfg.SetValue("Glorp", "maxFallSpeed",       Glorp.MaxFallSpeed);
@@ -417,6 +460,10 @@ public partial class Main
 		// Mirrors
 		BezierMirror.RdpEpsilon = G("Mirrors","rdpEpsilon", BezierMirror.RdpEpsilon);
 		BezierMirror.RawMinDist = G("Mirrors","rawMinDist", BezierMirror.RawMinDist);
+
+		// Arm
+		_pincerHalfWidth = Math.Clamp(I("Arm","pincerHalfWidth", _pincerHalfWidth), 0, RoboArm.MaxPincerHalfWidth);
+		_pincerDepth     = Math.Clamp(I("Arm","pincerDepth",     _pincerDepth),     1, RoboArm.MaxPincerDepth);
 
 		// Glorp
 		Glorp.Gravity           = G("Glorp","gravity",          Glorp.Gravity);
