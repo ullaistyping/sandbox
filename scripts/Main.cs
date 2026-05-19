@@ -708,6 +708,73 @@ public partial class Main : Control
 			c.DrawArc(sw.Center, sw.Radius, 0, MathF.PI * 2f, 48, new Color(1f, 0.85f, 0.35f, a * 0.85f),  2f);
 			c.DrawArc(sw.Center, sw.Radius * 0.25f, 0, MathF.PI * 2f, 24, new Color(1f, 0.95f, 0.8f, a * a * 0.6f), 5f);
 		}
+		DrawBrushCursor(c);
+	}
+
+	private void DrawBrushCursor(OverlayCanvas c)
+	{
+		if (ImGuiNET.ImGui.GetIO().WantCaptureMouse) return;
+
+		var  col    = new Color(1f, 1f, 1f, 0.80f);
+		const float lw = 1.5f;
+		var  center = new Vector2((_mouseSim.X + 0.5f) * Scale, (_mouseSim.Y + 0.5f) * Scale);
+
+		switch (_brush)
+		{
+			case BrushTurret:
+			{
+				// Outline of the 5×3 main block plus the single-cell copper terminals
+				// that flank the middle row on both sides.
+				float s  = Scale;
+				float ox = _mouseSim.X * s;
+				float oy = _mouseSim.Y * s;
+				var pts = new Vector2[]
+				{
+					new(ox - 2*s, oy      ),
+					new(ox + 3*s, oy      ),
+					new(ox + 3*s, oy +   s),
+					new(ox + 4*s, oy +   s),
+					new(ox + 4*s, oy + 2*s),
+					new(ox + 3*s, oy + 2*s),
+					new(ox + 3*s, oy + 3*s),
+					new(ox - 2*s, oy + 3*s),
+					new(ox - 2*s, oy + 2*s),
+					new(ox - 3*s, oy + 2*s),
+					new(ox - 3*s, oy +   s),
+					new(ox - 2*s, oy +   s),
+					new(ox - 2*s, oy      ),  // close
+				};
+				c.DrawPolyline(pts, col, lw);
+				break;
+			}
+
+			case BrushGlorp:
+				c.DrawArc(center, Glorp.SimR * Scale, 0, MathF.PI * 2f, 48, col, lw);
+				break;
+
+			case BrushForce:
+				// Force radius is brushSize * 3 (matches ApplyForce call)
+				c.DrawArc(center, _brushSize * 3 * Scale, 0, MathF.PI * 2f, 64, col, lw);
+				break;
+
+			case BrushPin:
+			{
+				float r = Math.Max(1, _brushSize / 2) * Scale;
+				c.DrawArc(center, r, 0, MathF.PI * 2f, 48, col, lw);
+				break;
+			}
+
+			case BrushHeatView:
+			case BrushMirror:
+				// HeatView shows its own selection rect; Mirror draws the live curve preview
+				break;
+
+			default:
+				// All cell-stamping brushes: Sand, Water, Stone, Lava, Gas, Food,
+				// Copper, Battery, Wood, Erase, Dirt, GrassSeed, TreeSeed, Fire, LN2
+				c.DrawArc(center, (_brushSize + 0.5f) * Scale, 0, MathF.PI * 2f, 64, col, lw);
+				break;
+		}
 	}
 
 	// ── UI state ──────────────────────────────────────────────────────────────
