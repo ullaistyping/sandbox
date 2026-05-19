@@ -2,104 +2,103 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Overview
+## North star
 
-A pixel-art falling-sand sandbox simulation built in **C# with Godot 4.6** (Forward Plus / D3D12). Despite the project using Jolt Physics for 3D, all simulation physics is hand-rolled in C#.
+**Interesting interactions between materials.** Everything in this sandbox is justified by the reactions it enables. When adding or tuning a material, the question is never "does it look right" — it's "what new behaviours does this unlock when it touches the materials that already exist?" A new cell type with no reactions to existing cells is dead weight.
 
-- **Language:** C# (not GDScript — ignore the GDScript conventions section below for this codebase)
-- **Grid:** 320×180 cells, displayed at 4× scale (1280×720 screen)
-- **Simulation rate:** configurable TPS (default 30), separate from render rate
+The core loop the player is meant to discover:
+- **Heat as a circulatory system.** Lava and LN2 are sources; copper is the wire. Heat flows through connected copper as a distance field, which lets the player build kettles, freezers, gas-detonators, and ice machines out of geometry alone.
+- **Electricity as a parallel network.** Batteries push current through copper. The same wire that carries heat also powers laser turrets — wiring a heater also wires a weapon.
+- **Fire as a state-spreading reaction.** Fire ignites flammables, makes smoke, boils water → steam, is killed by water/LN2 → steam/N2 gas. Burnable structures (trees, grown from seeds on dirt) make the world fuel-rich.
+- **Phase changes everywhere.** Water ↔ Ice ↔ Steam, LN2 ↔ N2 gas, Gas → explosion when ignited by lava or hot copper. Phase boundaries are where the interesting interactions happen.
+- **Mirrors + turrets** turn the laser into a puzzle element — turret needs power (copper + battery), beam reflects off mirrors, the player aims it like a thrown line.
 
-## Running
+When evaluating a proposed feature, ask: does it create at least one new edge in the material interaction graph? If not, push back.
 
-```
-godot --path U:/code/Godot-games/sandbox
-```
+## Running and building
 
-Console (`` ` `` key): `tps <n>`, `brush <n>`, `clear`, `boil <n>`, `gasthresh <n>`
+This is a **Godot 4.6.2 + .NET 8** project. There is no separate build/test step — Godot drives the C# compile.
+
+- **Run the game**: open `project.godot` in Godot 4.6, press F5. Main scene is `scenes/main.tscn`.
+- **Build only**: `dotnet build Sandbox.sln` (or let the editor do it on save).
+- **No test suite.** Behaviour is verified by playing the sim.
+
+There are no Cursor rules, Copilot instructions, or README.
 
 ## Architecture
 
-### Core files
+### Two coupled layers
 
-| File | Role |
-|---|---|
-| `scripts/Simulation.cs` | Cell physics engine — all element update rules, velocity, electricity |
-| `scripts/Main.cs` | Wood rigid bodies, rendering, input, UI, Glorp spawning |
-| `scripts/Glorp.cs` | AI creature — needs, pathfinding, physics, rendering |
-| `scripts/OverlayCanvas.cs` | Thin overlay node for debug/preview drawing on top of the sim texture |
-| `scenes/main.tscn` | Single scene; root is Control → TextureRect + UI tree |
+1. **Per-cell simulation** (`scripts/Simulation.cs`) — a `320×180` grid of `Cell` enums plus parallel arrays (`Flow`, `Electric`, `Pinned`, `VelX`, `VelY`). One `Update()` runs every tick.
+2. **Macro objects** that live on top of the grid: `Glorp` creatures (`scripts/Glorp.cs`), laser turrets (nested class in `Main.cs`), and the unfinished `WoodPiece` rigid body system.
 
-### Simulation.cs — cell grid
+`Main.cs` owns rendering, input, the brush system, the console, turret/glorp/shockwave lists, and the per-frame loop that calls `_sim.Update()` at `_ticksPerSecond`. `Simulation` is a plain `RefCounted` — it knows nothing about Godot rendering.
 
-`Simulation` owns parallel flat arrays indexed `y * SimW + x`:
+### The parallel-array convention
 
-- `Grid[]` (byte) — cell type enum
-- `Flow[]` (byte) — dual purpose: water flow direction OR copper heat (0–255)
-- `Electric[]` (byte) — electricity propagation
-- `VelX[], VelY[]` (float) — velocity for loose particles (sand, water, lava, gas, steam)
-- `Pinned[]` (byte) — locked cells (pin tool)
+Every per-cell datum is stored as a flat `byte[]` or `float[]` of length `SimW * SimH`, indexed by `y * SimW + x`. `Flow` is overloaded by cell type — for water it's temperature (0=ice, 128=room, 255=boiling), for copper it's also temperature on the same scale, for fire/smoke it's lifetime ticks, for stone/dirt it's a colour-jitter seed. Always check `Grid[i]` before interpreting `Flow[i]`.
 
-Cell types (11): Air, Sand, Water, Stone, Lava, Gas, Food, Copper, Steam, Battery, Wood.
+### Update order (one tick)
 
-Wood cells are **not** updated by `Simulation.Update()` — they are owned and moved entirely by `Main.cs`.
-
-### Main.cs — wood physics (`WoodPiece` class)
-
-Wood is handled as **macro-level rigid bodies** outside the per-pixel simulation. Each `WoodPiece` stores:
-
-- `LocalCells` — unrotated cell offsets from centre of mass (CoM)
-- `GridCells` — current world positions (updated each tick)
-- `Position` (float) — CoM in sim-space
-- `Angle` — rotation in radians
-- `VelY, SubY` — vertical velocity + sub-pixel accumulator
-- `AngVel` — angular velocity (rad/tick)
-
-**Rotation pipeline (per tick, `UpdateWoodPieces`):**
-1. `ProjectCells()` rotates `LocalCells` through `(Position, Angle)` → world integer coords
-2. `CanOccupy()` checks the projected footprint against the grid (air/steam only, respects pins)
-3. `StampGrid()` clears old cells, stamps new positions as Wood
-4. Landing torque: bottom-edge cells below a solid compute average X offset from CoM → `AngVel += offset * VelY * LandAngFactor`
-5. Angular damping: `AngVel *= AngDamp` each tick
-
-**Current known physics problems (Crayon Physics goal):**
-
-The rotation system has been attempted but does not yet work robustly. Specific failure modes:
-- Pieces placed flat rarely gain angular velocity from landing
-- Rotation can become stuck or oscillate without settling
-- No horizontal (X-axis) velocity — pieces only fall vertically; they cannot slide sideways after landing, which prevents natural tipping
-- The `LandAngFactor` (0.0018) and the integer-step Y movement interact poorly — the `VelY` at the moment of collision is clamped before the torque impulse fires, weakening it significantly
-
-**What a robust solution needs:**
-- Separate `VelX` on `WoodPiece` (pieces must be able to slide sideways)
-- Torque from rotational inertia (moment of inertia based on piece shape, not just contact offset × velocity)
-- Possibly sub-pixel X movement (same accumulator pattern as Y)
-- Collision response that also reflects horizontal momentum
-- Resting detection that truly zeroes `AngVel` when settled on flat ground, rather than relying solely on damping
-
-### Main.cs — rendering
-
-`Render()` builds a raw RGBA8 byte array each frame and pushes it to an `ImageTexture`. The `Flow` byte drives color variation (water direction tint, stone/lava grain, copper heat gradient, wood grain hash). Gas and Steam are alpha-blended with the air color inline.
-
-### Glorp.cs — AI creatures
-
-Glorps live at `SimPos` (float sim-space coords), not grid cells. They have independent physics (gravity, friction, bounce, step-up) and a needs system (hunger, thirst, social) that drives goal-seeking AI. They render as 12×12 pixel textures drawn via `DrawTexture` on the `OverlayCanvas`.
-
-## Key constants to tune (all in `UpdateWoodPieces`)
-
-```csharp
-const float GravPerTick   = 0.35f;
-const float SteamLift     = 0.60f;   // per steam cell below bottom edge
-const float MaxFall       = 8f;
-const float MaxRise       = 3f;
-const float AngDamp       = 0.88f;   // angular velocity decay per tick
-const float MaxAngVel     = 0.055f;  // ~3° per tick cap
-const float LandAngFactor = 0.0018f; // contact offset → angular impulse
+```
+Simulation.Update()
+  1. UpdateVelocityCells()   — ballistic cells (sand/water/lava with VelX,VelY != 0) move first
+  2. Per-cell scan, bottom-to-top, alternating L→R / R→L each tick (the _flip)
+        dispatched through UpdateCell → per-element rules (UpdateSand, UpdateWater, …)
+        each rule uses Swap() which marks _visited so cells move at most once per tick
+  3. PropagateElectricity()  — flood-fill from Battery cells through connected Copper
+  4. PropagateHeat()         — two BFS distance-field passes (hot from Lava/Fire, cold from LN2)
+                               then symmetric ramp toward target heat, then side-effects
+                               (boil water, ignite gas, freeze steam)
 ```
 
-## GDScript Conventions
+The BFS heat field is the reason copper temperature behaves symmetrically and is scan-order-independent — earlier versions used a one-pass diffuse and were buggy.
 
-- Use `class_name` declarations for reusable scripts
-- Prefer `@export` variables over hard-coded values for tunable parameters
-- Use `@onready` for node references rather than storing paths as strings
-- Signal connections should be made in `_ready()` using `signal.connect()`
+### Cell vs static-structure cells
+
+Some `Cell` values are **structural** — they never run an update rule and are treated as solid: `Stone`, `Wood`, `Bark`, `Leaves`, `Mirror`, `Battery`, `Ice`. Look at the switch in `UpdateCell` (~`Simulation.cs:326`) — anything not in the switch is static. `Pinned[i] != 0` further marks any cell as immovable regardless of type (used for tree trunks, turret bases, and the pin tool).
+
+### Reactions live on both sides
+
+A reaction between two cells (e.g. lava + water → stone, water + LN2 → ice + N2 gas) is usually triggered from one cell's update rule (`UpdateLava`, `UpdateWater`, etc.). Be careful: when adding a new pair, decide which side scans for the other, and make sure you `_visited[i] = 1` on both cells if both change, or one will get re-processed within the same tick. `Swap()` does this automatically.
+
+### Velocity cells (`UpdateVelocityCells`)
+
+Cells with non-zero `VelX`/`VelY` (set by explosions or `ApplyForce`) follow a ballistic trajectory until they collide, with sub-pixel stepping. This system is for *projectile* behaviour layered on top of normal element rules — most cells normally have zero velocity. Static types (Wood, Copper, Battery, Mirror, etc.) zero their velocity at the top of the function.
+
+### Heat propagation specifics (`PropagateHeat`)
+
+- `HeatRange` caps how many copper hops heat travels. Beyond that, copper stays at room temp.
+- `HeatFireDist` seeds copper touching fire as if it were that many hops from lava — fire is weaker than lava as a heat source.
+- `HeatSmoothing` is the divisor for moving `Flow[i]` toward the target each tick. 1 = instant, higher = slow ramp. **Smoothing is essential for stable thermal "circuits"** — without it, oscillation is easy.
+- Side effects (boil/ignite/freeze) fire only when smoothed `Flow[i]` crosses a threshold, not when the BFS hits a source. This means cold copper *can* be next to lava if there's only a single-cell connection — the smoothing damps it.
+
+### Macro entities on the grid
+
+- **`Glorp`** is a `Node2D` with float position. It reads `_sim.GetCell` for ground/wall detection but writes only to eat (`SetCell(..., Air)`). It has its own gravity/squish/rolling physics independent of the cell sim. Multiple Glorps are stored in `_glorps` and passed into each Glorp's `Init` so they can sense each other.
+- **`LaserTurret`** (private class in `Main.cs`) occupies a `5×3` block of Stone/Battery cells plus two copper terminals on the sides. `CheckPowered` reads `_sim.Electric` at the terminals — so wiring electricity to the turret simply means: route copper from a battery to either side. The beam itself is non-destructive geometry traced in `CastLaserRay`, not cells.
+- **`WoodPiece` / rigid bodies** — see "Active in-progress work" below.
+
+### Rendering pipeline
+
+`Render()` (in `Main.cs`) walks the grid once per frame and writes RGBA into `_raw[]`, then uploads to a single `ImageTexture` shown by `TextureRect`. Per-cell colour is computed by `CellColor` (mostly a lookup) with special-cased translucency for gas/steam/smoke/N2 (blended over the air colour) and a heat-gradient for water and copper. `OverlayCanvas` is a sibling node drawn on top for laser beams, shockwaves, mirror X marks, pin highlights, and the heat-view rectangle.
+
+## Wood is a static cell — the rigid-body experiment is abandoned
+
+Wood is just another structural cell type, like Stone or Bark. It doesn't fall, rotate, or behave as a rigid body. Don't try to revive the Crayon-Physics-style rigid body system — it was investigated and abandoned as a failed experiment.
+
+`docs/plans/rigid-body-physics.md` is kept as a historical record of *why* the approach didn't fit, not as a TODO. The short version: continuous float-space bodies stamping onto a per-cell grid created too many awkward boundary cases (collision response with falling sand, force transmission from fluid cells, sleep/wake corner cases) for the value it delivered, and the cell-grid sim is the part of this codebase that's actually interesting. If a player wants something to fall, they use sand or dirt. Wood is for structures.
+
+If you find yourself wanting to add rotation, momentum, or "rigid" behaviour to a new material — stop and design a different interaction instead. The grid is the design space.
+
+## Conventions
+
+- **No physics engine on the 2D sim** — everything is hand-rolled. Avoid pulling in Godot's `RigidBody2D` for sandbox elements; it doesn't compose with the cell grid.
+- **Tabs for indentation** in `.cs` files (existing files use tabs — match that, not spaces).
+- **Reactions go where the change happens.** If lava becomes stone next to water, the rule lives in `UpdateLava`. Don't split a single reaction across two element rules unless the design genuinely calls for it (steam-from-fire-extinction is one such case).
+- **`Pinned` is the universal "don't move" flag.** Respect it in any new cell mover, swap helper, or explosion routine. `Swap()` and `Explode()` already check it.
+- **Console first for tuning.** Thresholds (boil, gasthresh, firerate, fireticks, seedrate, treerate, icethresh) are runtime-tweakable via the `~` console — prefer adding a console command over a recompile loop when iterating.
+
+## Useful console commands at runtime
+
+Backtick (`` ` ``) toggles the console. `help` lists everything; key tuning commands: `tps`, `brush`, `clear`, `boil`, `gasthresh`, `firerate`, `fireticks`, `seedrate`, `treerate`, `icethresh`. Tab autocompletes.
