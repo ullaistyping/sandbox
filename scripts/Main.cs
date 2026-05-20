@@ -169,6 +169,11 @@ public partial class Main : Control
 	private float   _wireSnapRadius = 8f;    // sim-cell radius for snapping to batteries/terminals/nodes
 	private Vector2 _mouseSimF;              // float-precision mouse in sim space (for wire ghost)
 
+	// Context-sensitive Space — closest machine within this radius is the Space target each frame
+	private const float MachineSpaceRadius = 6f;
+	private LaserTurret _spaceTargetTurret;
+	private RoboArm     _spaceTargetArm;
+
 	// Quick select radial
 	private bool    _radialOpen         = false;
 	private Vector2 _radialOriginScreen;
@@ -352,6 +357,7 @@ public partial class Main : Control
 		// Wire power runs after the last sim tick so it writes into Electric[] after
 		// PropagateElectricity has built the copper network for this frame.
 		PropagateWirePower();
+		UpdateMachineSpaceTarget();
 		UpdateTurrets();
 		UpdateArms();
 		TickPreview();
@@ -472,7 +478,21 @@ public partial class Main : Control
 			// Yield Space to ImGui when a text input is focused (e.g. console tab).
 		if (k.Keycode == Key.Space && !ImGuiNET.ImGui.GetIO().WantCaptureKeyboard)
 			{
-				ToggleActiveArmClaw();
+				// Context-sensitive: near turret → toggle freeze; near arm → toggle claw.
+				// Falls back to the most-recently-dragged arm if nothing else is near.
+				if (_spaceTargetTurret != null)
+				{
+					_spaceTargetTurret.Frozen = !_spaceTargetTurret.Frozen;
+					_sim.RenderDirty = true;
+				}
+				else if (_spaceTargetArm != null)
+				{
+					ToggleArmClaw(_spaceTargetArm);
+				}
+				else
+				{
+					ToggleActiveArmClaw();
+				}
 				GetViewport().SetInputAsHandled();
 				return;
 			}
@@ -1289,6 +1309,31 @@ public partial class Main : Control
 		_turrets.Add(LaserTurret.Place(_sim, origin));
 	}
 
+	// Picks the closest turret or arm to the mouse cursor within MachineSpaceRadius.
+	// The result drives both the Space-key dispatch and the "near" visual highlight.
+	// Only one machine is returned — if a turret and arm are both in range, the closer wins.
+	private void UpdateMachineSpaceTarget()
+	{
+		_spaceTargetTurret = null;
+		_spaceTargetArm    = null;
+		if (ImGuiNET.ImGui.GetIO().WantCaptureMouse) return;
+
+		float bestDist = MachineSpaceRadius;
+		foreach (var t in _turrets)
+		{
+			// Turret pivot is at the visual centre of the base block
+			var center = new Vector2(t.Origin.X + 0.5f, t.Origin.Y + 1.5f);
+			float d = _mouseSimF.DistanceTo(center);
+			if (d < bestDist) { bestDist = d; _spaceTargetTurret = t; _spaceTargetArm = null; }
+		}
+		foreach (var a in _arms)
+		{
+			var center = new Vector2(a.Origin.X + 0.5f, a.Origin.Y + 0.5f);
+			float d = _mouseSimF.DistanceTo(center);
+			if (d < bestDist) { bestDist = d; _spaceTargetArm = a; _spaceTargetTurret = null; }
+		}
+	}
+
 	private void UpdateTurrets()
 	{
 		float maxDelta = Mathf.DegToRad(ScriptSmoothingSpeed * _scriptTicksThisFrame);
@@ -1305,8 +1350,9 @@ public partial class Main : Control
 				t.Angle = MoveAngleToward(t.Angle, t.TargetAngle, maxDelta);
 				_sim.RenderDirty = true;
 			}
-			else
+			else if (!t.Frozen)
 			{
+				// Manual aim — disabled when frozen (Space toggle) so the turret holds its last angle
 				t.UpdateAngle(_mouseSim);
 			}
 		}
@@ -1472,6 +1518,10 @@ public partial class Main : Control
 			c.DrawCircle(sh, 3.5f, pivotCol);
 			c.DrawCircle(el, 3.0f, pivotCol);
 
+			// "Near" highlight — ring around the shoulder when Space would target this arm
+			if (a == _spaceTargetArm)
+				c.DrawArc(sh, 7f, 0f, MathF.PI * 2f, 24, new Color(0.4f, 0.85f, 1.0f, 0.65f), 1.5f);
+
 			// Pincer indicator: closed = thin tip line; open = rectangle showing grab zone.
 			Vector2 perpScr = a.PincerPerp * Scale;
 			Vector2 fwdScr  = new Vector2(MathF.Cos(a.ElbowAngle), MathF.Sin(a.ElbowAngle)) * Scale;
@@ -1525,6 +1575,15 @@ public partial class Main : Control
 			var dir     = new Vector2(MathF.Cos(t.Angle), MathF.Sin(t.Angle));
 			var tipScr  = pivotScr + dir * barrelPx;
 			c.DrawLine(pivotScr, tipScr, barrelCol, 3f);
+
+			// "Near" highlight — pulsing ring around the pivot when Space would target this turret
+			if (t == _spaceTargetTurret)
+				c.DrawArc(pivotScr, Scale * 3.5f, 0f, MathF.PI * 2f, 32, new Color(0.4f, 0.85f, 1.0f, 0.65f), 1.5f);
+
+			// Frozen indicator — small filled square at the pivot so the user can see at a
+			// glance which turrets they've intentionally taken off mouse-aim
+			if (t.Frozen)
+				c.DrawRect(new Rect2(pivotScr.X - 3f, pivotScr.Y - 3f, 6f, 6f), new Color(0.9f, 0.9f, 1.0f, 0.85f), true);
 
 			// Beam only fires when powered AND the script (or default) wants the laser on
 			if (!t.Powered || !t.LaserOn) continue;
@@ -1885,6 +1944,7 @@ public partial class Main : Control
 		public float              TargetAngle;                    // scripted target — Angle smoothly approaches this each tick
 		public bool               Powered;
 		public bool               LaserOn = true;                 // scripts can toggle this; default fires whenever powered
+		public bool               Frozen;                         // Space-toggled: stops mouse-aim, keeps firing. Scripted turrets ignore Frozen.
 		public ScriptRuntime      ScriptRT;                       // null = manual (mouse-aim); non-null = scripted
 		public readonly List<int> OccupiedIndices = new();
 
