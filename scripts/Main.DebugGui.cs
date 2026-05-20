@@ -89,6 +89,12 @@ public partial class Main
 		if (ImGui.SliderFloat("Stop Threshold", ref st, 0f, 1f, "%.2f")) _sim.StopThr = st;
 		ImGui.SetItemTooltip("Velocity below which a moving cell is frozen in place");
 
+		ImGui.SeparatorText("Fluids");
+
+		int wsd = _sim.WaterSpreadDist;
+		if (ImGui.SliderInt("Water Spread Distance", ref wsd, 1, 16)) _sim.WaterSpreadDist = wsd;
+		ImGui.SetItemTooltip("Max cells water travels horizontally per tick — higher = faster leveling");
+
 		ImGui.EndTabItem();
 	}
 
@@ -436,10 +442,11 @@ public partial class Main
 		// Simulation
 		cfg.SetValue("Simulation", "tps",      _ticksPerSecond);
 		cfg.SetValue("Simulation", "brushSize", _brushSize);
-		cfg.SetValue("Simulation", "gravity",   _sim.Gravity);
-		cfg.SetValue("Simulation", "friction",  _sim.Friction);
-		cfg.SetValue("Simulation", "dampCol",   _sim.DampCol);
-		cfg.SetValue("Simulation", "stopThr",   _sim.StopThr);
+		cfg.SetValue("Simulation", "gravity",      _sim.Gravity);
+		cfg.SetValue("Simulation", "friction",     _sim.Friction);
+		cfg.SetValue("Simulation", "dampCol",      _sim.DampCol);
+		cfg.SetValue("Simulation", "stopThr",      _sim.StopThr);
+		cfg.SetValue("Simulation", "waterSpread",  _sim.WaterSpreadDist);
 
 		// Heat
 		cfg.SetValue("Heat", "boilThreshold",  _sim.CopperBoilThreshold);
@@ -511,10 +518,11 @@ public partial class Main
 		// Simulation
 		_ticksPerSecond = I("Simulation","tps",           _ticksPerSecond);
 		_brushSize      = I("Simulation","brushSize",      _brushSize);
-		_sim.Gravity    = G("Simulation","gravity",        _sim.Gravity);
-		_sim.Friction   = G("Simulation","friction",       _sim.Friction);
-		_sim.DampCol    = G("Simulation","dampCol",        _sim.DampCol);
-		_sim.StopThr    = G("Simulation","stopThr",        _sim.StopThr);
+		_sim.Gravity         = G("Simulation","gravity",        _sim.Gravity);
+		_sim.Friction        = G("Simulation","friction",       _sim.Friction);
+		_sim.DampCol         = G("Simulation","dampCol",        _sim.DampCol);
+		_sim.StopThr         = G("Simulation","stopThr",        _sim.StopThr);
+		_sim.WaterSpreadDist = I("Simulation","waterSpread",    _sim.WaterSpreadDist);
 
 		// Heat
 		_sim.CopperBoilThreshold = I("Heat","boilThreshold", _sim.CopperBoilThreshold);

@@ -390,6 +390,7 @@ public partial class Main : Control
 		}
 
 		// Block game input when any UI owns the mouse
+		if (_scriptEditorOpen) return;
 		if (ImGuiNET.ImGui.GetIO().WantCaptureMouse) return;
 		if (_tab.GetGlobalRect().HasPoint(mouse)) return;
 		if (_detached  && _toolBox.GetGlobalRect().HasPoint(mouse)) return;
@@ -546,10 +547,16 @@ public partial class Main : Control
 		if (@event is InputEventMouseButton mb)
 		{
 			var mouse = mb.Position;
-			bool overUI = ImGuiNET.ImGui.GetIO().WantCaptureMouse
+			bool overUI = _scriptEditorOpen
+						|| ImGuiNET.ImGui.GetIO().WantCaptureMouse
 						|| _tab.GetGlobalRect().HasPoint(mouse)
 						|| (_toolBoxExpanded && _panel.GetGlobalRect().HasPoint(mouse))
 						|| (_detached        && _toolBox.GetGlobalRect().HasPoint(mouse));
+
+			// Hard guard for PRESS events: when any UI owns the mouse, ignore the
+			// press so nothing in Main reacts (wheel scrolls, RMB Glorp select, etc.)
+			// Release events still flow through so drag-state cleanup can run.
+			if (mb.Pressed && overUI) return;
 
 			if (mb.Pressed)
 			{
@@ -1253,6 +1260,7 @@ public partial class Main : Control
 				ConsoleLog("  [color=white]seedrate <0-1>[/color]    grass seed sprout chance per tick (default 0.003)");
 				ConsoleLog("  [color=white]treerate <0-1>[/color]    tree seed grow chance per tick (default 0.001)");
 				ConsoleLog("  [color=white]icethresh <n>[/color]     copper temp below which it freezes water (default 64)");
+				ConsoleLog("  [color=white]waterspread <n>[/color]   max cells water travels horizontally per tick (1–32, default 4)");
 				ConsoleLog("  [color=white]laserfalloff <0-1>[/color] laser power multiplier per bounce (0=instant, 1=no decay, default 0.4)");
 				ConsoleLog("  [color=white]lasermax <n>[/color]      max mirror bounces per beam (default 12)");
 				ConsoleLog("  [color=white]mirrordist <f>[/color]    mirror raw sample chord length in sim units (default 1.0)");
@@ -1295,6 +1303,11 @@ public partial class Main : Control
 			case "boil" when parts.Length > 1 && int.TryParse(parts[1], out int bt):
 				_sim.CopperBoilThreshold = Math.Clamp(bt, 0, 255);
 				ConsoleLog($"[color=cyan]Copper boil threshold → {_sim.CopperBoilThreshold}[/color]");
+				break;
+
+			case "waterspread" when parts.Length > 1 && int.TryParse(parts[1], out int ws):
+				_sim.WaterSpreadDist = Math.Clamp(ws, 1, 32);
+				ConsoleLog($"[color=cyan]Water spread distance → {_sim.WaterSpreadDist} cells/tick[/color]");
 				break;
 
 			case "gasthresh" when parts.Length > 1 && int.TryParse(parts[1], out int gt):

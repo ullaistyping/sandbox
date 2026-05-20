@@ -20,6 +20,7 @@ public partial class Simulation : RefCounted
 	public byte[]  Flow;     // water: flow dir; copper: heat 0-255
 	public byte[]  Electric; // 1 if copper cell is electrified this tick
 	public byte[]  Pinned;   // 1 = cell is pinned (never moves)
+	public byte[]  Settled;  // 1 = water cell can skip horizontal spread this tick
 	public float[] VelX;
 	public float[] VelY;
 	// Bumped whenever pixel-visible state may have changed. Main reads this to
@@ -51,6 +52,7 @@ public partial class Simulation : RefCounted
 	public int   FireBaseTicks       = 30;
 	public float GrassSeedRate       = 0.003f;
 	public float TreeSeedRate        = 0.001f;
+	public int   WaterSpreadDist     = 4;   // max cells water can travel horizontally per tick
 
 	public Simulation()
 	{
@@ -59,6 +61,7 @@ public partial class Simulation : RefCounted
 		Flow     = new byte[size];
 		Electric = new byte[size];
 		Pinned   = new byte[size];
+		Settled  = new byte[size];
 		VelX     = new float[size];
 		VelY     = new float[size];
 		_visited  = new byte[size];
@@ -84,7 +87,20 @@ public partial class Simulation : RefCounted
 		else
 			Flow[i] = 0;
 		VelX[i] = 0; VelY[i] = 0;
+		WakeNeighbors(x, y);
 		RenderDirty = true;
+	}
+
+	// Clears the Settled flag on (x,y) and its 4 neighbors so settled water re-checks
+	// its surroundings next tick. Called from every mutation path that can change
+	// what a settled cell "sees" — Swap, SetCell, explosions, reactions, etc.
+	private void WakeNeighbors(int x, int y)
+	{
+		if (InBounds(x, y))     Settled[y       * SimW + x      ] = 0;
+		if (InBounds(x - 1, y)) Settled[y       * SimW + (x - 1)] = 0;
+		if (InBounds(x + 1, y)) Settled[y       * SimW + (x + 1)] = 0;
+		if (InBounds(x, y - 1)) Settled[(y - 1) * SimW + x      ] = 0;
+		if (InBounds(x, y + 1)) Settled[(y + 1) * SimW + x      ] = 0;
 	}
 
 	public void SetPinned(int x, int y, bool pin)
@@ -369,6 +385,12 @@ public partial class Simulation : RefCounted
 		(VelX[bi], VelX[ai]) = (VelX[ai], VelX[bi]);
 		(VelY[bi], VelY[ai]) = (VelY[ai], VelY[bi]);
 		_visited[bi] = 1;
+		// A swap always disturbs the local neighborhood — wake settled water nearby
+		// so it re-checks fall/spread, and clear the swapped cells themselves.
+		Settled[ai] = 0;
+		Settled[bi] = 0;
+		WakeNeighbors(ax, ay);
+		WakeNeighbors(bx, by);
 	}
 
 	// ── Element rules ─────────────────────────────────────────────────────────
@@ -489,7 +511,7 @@ public partial class Simulation : RefCounted
 			if (gy < SimH-1) Try(idx + SimW);
 		}
 		if (gasCells.Count == 0) return;
-		foreach (var (gx, gy) in gasCells) { Grid[gy*SimW+gx]=(byte)Cell.Air; Flow[gy*SimW+gx]=0; }
+		foreach (var (gx, gy) in gasCells) { Grid[gy*SimW+gx]=(byte)Cell.Air; Flow[gy*SimW+gx]=0; WakeNeighbors(gx, gy); }
 		long sx = 0, sy = 0;
 		foreach (var (gx, gy) in gasCells) { sx += gx; sy += gy; }
 		int cx = (int)(sx / gasCells.Count), cy = (int)(sy / gasCells.Count);
@@ -525,15 +547,69 @@ public partial class Simulation : RefCounted
 			if (Grid[i] == (byte)Cell.Air) continue;
 			if (Pinned[i] != 0) continue;
 			if (distSq <= innerR2)
-			{ Grid[i]=(byte)Cell.Air; Flow[i]=0; VelX[i]=0; VelY[i]=0; }
+			{ Grid[i]=(byte)Cell.Air; Flow[i]=0; VelX[i]=0; VelY[i]=0; WakeNeighbors(x, y); }
 			else
 			{
 				float dist = MathF.Sqrt(distSq), falloff = 1f - dist / radius;
 				float speed = 4f + 9f * falloff;
 				VelX[i] = dx / dist * speed; VelY[i] = dy / dist * speed;
+				WakeNeighbors(x, y);
 			}
 		}
 		PendingExplosions.Add((cx, cy, radius));
+	}
+
+	// Pass A — productive drop search. Walks up to WaterSpreadDist cells in `dir`,
+	// dropping into the first air gap found directly below the walk path. Returns
+	// true if the cell moved. Used by surface water for fast basin-filling.
+	private bool TryDropSearch(int x, int y, int dir)
+	{
+		int maxDist = Math.Max(1, WaterSpreadDist);
+		for (int step = 1; step <= maxDist; step++)
+		{
+			int nx = x + dir * step;
+			if (nx < 0 || nx >= SimW) break;
+			if (GetCell(nx, y) != (byte)Cell.Air) break;
+			if (y + 1 < SimH && GetCell(nx, y + 1) == (byte)Cell.Air)
+			{
+				Swap(x, y, nx, y + 1);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Pass B — deterministic lateral spread for surface water with a clear
+	// gradient. The cell walks up to WaterSpreadDist cells toward the side
+	// whose immediate neighbor is air (the other side blocked by water/stone).
+	// Skips entirely when both sides are air or both are blocked:
+	//   both blocked → caller settles
+	//   both air     → no clear gradient; moving would just oscillate (parity
+	//                  tiebreak picks left this tick, right the next), so we
+	//                  also settle. Pass A handles flattening of peaks if a
+	//                  drop exists within WaterSpreadDist.
+	private bool TrySpreadLateral(int x, int y)
+	{
+		bool leftAir  = x > 0          && GetCell(x - 1, y) == (byte)Cell.Air;
+		bool rightAir = x < SimW - 1   && GetCell(x + 1, y) == (byte)Cell.Air;
+		if (leftAir == rightAir) return false; // both air or both blocked
+
+		int dir = leftAir ? -1 : 1;
+		int maxDist = Math.Max(1, WaterSpreadDist);
+		int prevX = x;
+		for (int step = 1; step <= maxDist; step++)
+		{
+			int nx = x + dir * step;
+			if (nx < 0 || nx >= SimW) break;
+			if (GetCell(nx, y) != (byte)Cell.Air) break;
+			prevX = nx;
+		}
+		if (prevX != x)
+		{
+			Swap(x, y, prevX, y);
+			return true;
+		}
+		return false;
 	}
 
 	private void UpdateWater(int x, int y)
@@ -557,16 +633,42 @@ public partial class Simulation : RefCounted
 			}
 		}
 
-		// Fall and spread (no direction memory — temp lives in Flow now)
+		// Fall and spread (no direction memory — temp lives in Flow now). These
+		// checks are cheap and always run, even for settled cells — so removing a
+		// stone wall under a settled pool correctly drains it next tick.
 		if (y+1 < SimH && GetCell(x, y+1) == (byte)Cell.Air) { Swap(x,y,x,y+1); return; }
 		bool dl = x>0       && y+1<SimH && GetCell(x-1,y+1)==(byte)Cell.Air;
 		bool dr = x<SimW-1  && y+1<SimH && GetCell(x+1,y+1)==(byte)Cell.Air;
 		if      (dl && dr) { if (_rng.NextSingle()<0.5f) Swap(x,y,x-1,y+1); else Swap(x,y,x+1,y+1); return; }
 		else if (dl) { Swap(x,y,x-1,y+1); return; }
 		else if (dr) { Swap(x,y,x+1,y+1); return; }
-		int dir1 = _rng.NextSingle()<0.5f ? -1 : 1;
-		if (x+dir1 >= 0 && x+dir1 < SimW && GetCell(x+dir1, y)==(byte)Cell.Air) { Swap(x,y,x+dir1,y); return; }
-		if (x-dir1 >= 0 && x-dir1 < SimW && GetCell(x-dir1, y)==(byte)Cell.Air) { Swap(x,y,x-dir1,y); return; }
+
+		// Surface vs interior split.
+		// Interior cells (water directly above) never drive horizontal flow; they
+		// settle immediately and only wake on neighbor changes. Surface cells
+		// (air above) drive leveling via the two passes below.
+		bool isSurface = y == 0 || GetCell(x, y - 1) != (byte)Cell.Water;
+
+		if (!isSurface)
+		{
+			Settled[i] = 1;
+		}
+		else if (Settled[i] == 0)
+		{
+			// Pass A — fast deep-drop search. Walk in both directions looking for
+			// an air gap to drop into. Tick parity picks which side to try first
+			// so symmetric drops on either side don't always favor the same one.
+			int firstDir = _flip ? -1 : 1;
+			if (TryDropSearch(x, y, firstDir))  return;
+			if (TryDropSearch(x, y, -firstDir)) return;
+
+			// Pass B — deterministic single-cell lateral spread.
+			if (TrySpreadLateral(x, y)) return;
+
+			// Nothing productive available — settle. Surface cells re-wake when
+			// any neighbor changes (Swap/SetCell/Explode call WakeNeighbors).
+			Settled[i] = 1;
+		}
 
 		// Stationary — conduct temperature
 		int temp = Flow[i];
