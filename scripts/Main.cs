@@ -300,6 +300,7 @@ public partial class Main : Control
 
 		InitQuickSelect();
 		ApplyMaterialButtonColors();
+		InitScripts();
 		_btnHeatView.Pressed     += () => SetBrush(BrushHeatView);
 		_btnPin.Pressed          += () => SetBrush(BrushPin);
 
@@ -314,10 +315,12 @@ public partial class Main : Control
 	{
 		_tickAccum += delta;
 		double interval = 1.0 / _ticksPerSecond;
+		_scriptTicksThisFrame = 0;
 		while (_tickAccum >= interval)
 		{
 			_sim.Update();
 			_tickAccum -= interval;
+			_scriptTicksThisFrame++;
 		}
 		// Spawn shockwave visuals for any explosions that fired this frame
 		foreach (var (ecx, ecy, erad) in _sim.PendingExplosions)
@@ -351,6 +354,7 @@ public partial class Main : Control
 		PropagateWirePower();
 		UpdateTurrets();
 		UpdateArms();
+		TickPreview();
 
 		// Update radial hover every frame (before UI early-returns so it's always live)
 		if (_radialOpen) UpdateRadialHover(mouse);
@@ -419,6 +423,8 @@ public partial class Main : Control
 			var simPos = ScreenToSim(mouse);
 			if (_brush == BrushPin)
 				ApplyPin(simPos, false); // RMB always unpins
+			else if (_brush == BrushScript)
+				DetachScriptAt(simPos);
 			else
 			{
 				StampCircle(simPos.X, simPos.Y, (int)Simulation.Cell.Air);
@@ -447,6 +453,12 @@ public partial class Main : Control
 			{
 				_wireModeActive = !_wireModeActive;
 				if (!_wireModeActive) _wirePendingIdx = -1; // cancel pending wire on exit
+				GetViewport().SetInputAsHandled();
+				return;
+			}
+			if (k.Keycode == Key.S && !ImGuiNET.ImGui.GetIO().WantCaptureKeyboard)
+			{
+				ToggleScriptEditor();
 				GetViewport().SetInputAsHandled();
 				return;
 			}
@@ -569,6 +581,10 @@ public partial class Main : Control
 					else if (_brush == BrushArm && !overUI)
 					{
 						PlaceArm(ScreenToSim(mouse));
+					}
+					else if (_brush == BrushScript && !overUI)
+					{
+						AttachActiveScriptAt(ScreenToSim(mouse));
 					}
 					else if (_brush == BrushMirror && !overUI)
 					{
@@ -993,10 +1009,12 @@ public partial class Main : Control
 		_settingsPage.Visible    = (tab == 1);
 		_analysisPage.Visible    = (tab == 2);
 		_quickSelectPage.Visible = (tab == 3);
+		_scriptsPage.Visible     = (tab == 4);
 		_btnTabMaterials.Modulate = tab == 0 ? Colors.Yellow : Colors.White;
 		_btnTabSettings.Modulate  = tab == 1 ? Colors.Yellow : Colors.White;
 		_btnTabAnalysis.Modulate  = tab == 2 ? Colors.Yellow : Colors.White;
 		_btnTabQuick.Modulate     = tab == 3 ? Colors.Yellow : Colors.White;
+		_btnTabScripts.Modulate   = tab == 4 ? Colors.Yellow : Colors.White;
 	}
 
 	private void ToggleDetach()
@@ -1273,10 +1291,24 @@ public partial class Main : Control
 
 	private void UpdateTurrets()
 	{
+		float maxDelta = Mathf.DegToRad(ScriptSmoothingSpeed * _scriptTicksThisFrame);
 		foreach (var t in _turrets)
 		{
 			t.Powered = t.CheckPowered(_sim);
-			t.UpdateAngle(_mouseSim);
+			if (t.ScriptRT != null)
+			{
+				// Scripted: advance runtime; manual aim is disabled while a script is attached
+				if (t.Powered)
+					TickRuntime(t.ScriptRT, _scriptTicksThisFrame, b => ExecuteTurretBlock(t, b));
+				// Smooth toward target every frame, even when unpowered (so the machine
+				// settles to its last commanded position rather than stalling mid-swing)
+				t.Angle = MoveAngleToward(t.Angle, t.TargetAngle, maxDelta);
+				_sim.RenderDirty = true;
+			}
+			else
+			{
+				t.UpdateAngle(_mouseSim);
+			}
 		}
 	}
 
@@ -1390,71 +1422,32 @@ public partial class Main : Control
 
 	private void UpdateArms()
 	{
+		float maxDelta = Mathf.DegToRad(ScriptSmoothingSpeed * _scriptTicksThisFrame);
 		foreach (var a in _arms)
+		{
 			a.Powered = a.CheckPowered(_sim);
+			if (a.ScriptRT != null)
+			{
+				if (a.Powered)
+					TickRuntime(a.ScriptRT, _scriptTicksThisFrame, b => ExecuteArmBlock(a, b));
+				// Smooth toward target joint angles
+				a.ShoulderAngle = MoveAngleToward(a.ShoulderAngle, a.TargetShoulderAngle, maxDelta);
+				a.ElbowAngle    = MoveAngleToward(a.ElbowAngle,    a.TargetElbowAngle,    maxDelta);
+				_sim.RenderDirty = true;
+			}
+		}
 	}
 
 	// Toggle the active arm's claw. Closing grabs whitelisted cells in the
 	// pincer area into the arm's Held list. Opening releases them as ballistic
 	// cells (downward velocity) — the velocity-cell physics handles the rest.
+	// Legacy fallback: toggle the most-recently-dragged arm. Used when Space is
+	// pressed with no arm/turret in proximity (e.g. after dragging a joint, before
+	// moving the mouse away). Delegates to the shared ToggleArmClaw helper.
 	private void ToggleActiveArmClaw()
 	{
-		if (_activeArm == null || !_activeArm.Powered) return;
-		var arm = _activeArm;
-
-		if (!arm.ClawClosed)
-		{
-			// Closing — grab matching cells at the current pincer size
-			int hw    = _pincerHalfWidth;
-			int depth = _pincerDepth;
-			int n     = RoboArm.PincerCellCount(hw, depth);
-			Span<Vector2I> pincer = stackalloc Vector2I[RoboArm.PincerCellCount(RoboArm.MaxPincerHalfWidth, RoboArm.MaxPincerDepth)];
-			arm.GetPincerCells(hw, depth, pincer[..n]);
-			arm.HeldHalfWidth = hw;
-			arm.HeldDepth     = depth;
-			arm.Held.Clear();
-			for (int i = 0; i < n; i++)
-			{
-				var p = pincer[i];
-				if (!_sim.InBounds(p.X, p.Y)) { arm.Held.Add((0, 0)); continue; }
-				int idx = p.Y * SimW + p.X;
-				byte c = _sim.Grid[idx];
-				if (_clawWhitelist.Contains(c) && _sim.Pinned[idx] == 0)
-				{
-					arm.Held.Add((c, _sim.Flow[idx]));
-					_sim.SetCell(p.X, p.Y, (int)Simulation.Cell.Air);
-				}
-				else
-				{
-					arm.Held.Add((0, 0));
-				}
-			}
-			arm.ClawClosed = true;
-		}
-		else
-		{
-			// Opening — release held cells using the hw/depth recorded at grab time
-			int n     = arm.Held.Count;
-			int hw    = arm.HeldHalfWidth;
-			int depth = arm.HeldDepth;
-			Span<Vector2I> pincer = stackalloc Vector2I[RoboArm.PincerCellCount(RoboArm.MaxPincerHalfWidth, RoboArm.MaxPincerDepth)];
-			arm.GetPincerCells(hw, depth, pincer[..n]);
-			for (int i = 0; i < n; i++)
-			{
-				var (cell, flow) = arm.Held[i];
-				if (cell == 0) continue;
-				var p = pincer[i];
-				if (!_sim.InBounds(p.X, p.Y)) continue;
-				int idx = p.Y * SimW + p.X;
-				if (_sim.Grid[idx] != (byte)Simulation.Cell.Air) continue;
-				_sim.SetCell(p.X, p.Y, cell);
-				_sim.Flow[idx] = flow;
-				_sim.VelY[idx] = 1.0f;
-			}
-			arm.Held.Clear();
-			arm.ClawClosed = false;
-		}
-		_sim.RenderDirty = true;
+		if (_activeArm == null) return;
+		ToggleArmClaw(_activeArm);
 	}
 
 	private void DrawArms(OverlayCanvas c)
@@ -1533,7 +1526,8 @@ public partial class Main : Control
 			var tipScr  = pivotScr + dir * barrelPx;
 			c.DrawLine(pivotScr, tipScr, barrelCol, 3f);
 
-			if (!t.Powered) continue;
+			// Beam only fires when powered AND the script (or default) wants the laser on
+			if (!t.Powered || !t.LaserOn) continue;
 
 			var startSim  = new Vector2(t.Origin.X + dir.X * 4.5f,
 										t.Origin.Y + dir.Y * 4.5f);
@@ -1888,7 +1882,10 @@ public partial class Main : Control
 
 		public Vector2I           Origin;
 		public float              Angle;
+		public float              TargetAngle;                    // scripted target — Angle smoothly approaches this each tick
 		public bool               Powered;
+		public bool               LaserOn = true;                 // scripts can toggle this; default fires whenever powered
+		public ScriptRuntime      ScriptRT;                       // null = manual (mouse-aim); non-null = scripted
 		public readonly List<int> OccupiedIndices = new();
 
 		public static LaserTurret Place(Simulation sim, Vector2I origin)
@@ -1970,10 +1967,13 @@ public partial class Main : Control
 		public const float ShoulderSkip     = 2.0f;  // skip the first 2 units of upper arm (inside our own base)
 
 		public Vector2I Origin;
-		public float    ShoulderAngle = -MathF.PI / 2f;
-		public float    ElbowAngle    = -MathF.PI / 2f;
+		public float    ShoulderAngle      = -MathF.PI / 2f;
+		public float    ElbowAngle         = -MathF.PI / 2f;
+		public float    TargetShoulderAngle = -MathF.PI / 2f;       // scripted target — actual angles smoothly approach
+		public float    TargetElbowAngle    = -MathF.PI / 2f;
 		public bool     ClawClosed;
 		public bool     Powered;
+		public ScriptRuntime ScriptRT;                              // null = manual (joint drag); non-null = scripted
 		public readonly List<(byte cell, byte flow)> Held = new();
 		public readonly List<int> OccupiedIndices = new();
 

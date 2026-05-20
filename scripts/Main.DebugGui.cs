@@ -44,6 +44,7 @@ public partial class Main
 			DrawMirrorsTab();
 			DrawWireTab();
 			DrawArmTab();
+			DrawScriptsTab();
 			DrawGlorpTab();
 			DrawConsoleTab();
 			ImGui.EndTabBar();
@@ -219,6 +220,34 @@ public partial class Main
 			_wirePendingIdx = -1;
 		}
 		ImGui.SetItemTooltip("Remove every wire node and edge from the world.");
+
+		ImGui.EndTabItem();
+	}
+
+	private void DrawScriptsTab()
+	{
+		if (!ImGui.BeginTabItem("Scripts")) return;
+
+		ImGui.SeparatorText("Machine Motion");
+
+		float speed = ScriptSmoothingSpeed;
+		if (ImGui.SliderFloat("Smoothing Speed", ref speed, 0.1f, 30f, "%.2f deg/tick"))
+			ScriptSmoothingSpeed = speed;
+		ImGui.SetItemTooltip(
+			"How fast scripted machines rotate toward their target angle, in degrees per simulation tick.\n" +
+			"Lower = slow, deliberate motion. Higher = snappier, near-instant.\n" +
+			"Default 3 deg/tick = 90 deg/sec at 30 TPS.\n" +
+			"Set Angle / Add Angle blocks set the target; this slider controls how fast the machine actually moves.");
+
+		ImGui.Text($"= {speed * _ticksPerSecond:F1} deg/sec at current TPS");
+
+		ImGui.SeparatorText("State");
+		int activeTurrets = 0; foreach (var t in _turrets) if (t.ScriptRT != null) activeTurrets++;
+		int activeArms    = 0; foreach (var a in _arms)    if (a.ScriptRT != null) activeArms++;
+		ImGui.Text($"Saved scripts:     {_scripts.Count}");
+		ImGui.Text($"Scripted turrets:  {activeTurrets} / {_turrets.Count}");
+		ImGui.Text($"Scripted arms:     {activeArms} / {_arms.Count}");
+		ImGui.Text($"Editor open:       {(_scriptEditorOpen ? "YES" : "no")}");
 
 		ImGui.EndTabItem();
 	}
@@ -459,6 +488,8 @@ public partial class Main
 		cfg.SetValue("Glorp", "talkRange",          Glorp.TalkRange);
 
 		SaveQuickProfiles(cfg);
+		SaveScripts(cfg);
+		cfg.SetValue("Scripts", "smoothingSpeed", ScriptSmoothingSpeed);
 
 		cfg.Save(CfgPath);
 		ConsoleLog("[color=cyan]Settings saved.[/color]");
@@ -532,5 +563,7 @@ public partial class Main
 		Glorp.TalkRange         = G("Glorp","talkRange",        Glorp.TalkRange);
 
 		LoadQuickProfiles(cfg);
+		LoadScripts(cfg);
+		ScriptSmoothingSpeed = Math.Clamp(G("Scripts", "smoothingSpeed", ScriptSmoothingSpeed), 0.1f, 30f);
 	}
 }

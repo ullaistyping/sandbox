@@ -106,6 +106,11 @@ layout_mode = 2
 size_flags_horizontal = 3
 text = "Quick"
 
+[node name="BtnTabScripts" type="Button" parent="UI/ToolBox/Panel/VBoxContainer/TabBar" unique_id=1048291700]
+layout_mode = 2
+size_flags_horizontal = 3
+text = "Scripts"
+
 [node name="MaterialsPage" type="VBoxContainer" parent="UI/ToolBox/Panel/VBoxContainer" unique_id=1613083604]
 layout_mode = 2
 size_flags_vertical = 3
@@ -314,3 +319,30 @@ size_flags_horizontal = 3
 theme_override_constants/h_separation = 4
 theme_override_constants/v_separation = 4
 columns = 4
+
+[node name="ScriptsPage" type="VBoxContainer" parent="UI/ToolBox/Panel/VBoxContainer" unique_id=1048291701]
+visible = false
+layout_mode = 2
+size_flags_vertical = 3
+theme_override_constants/separation = 4
+
+[node name="ScriptsToolbar" type="HBoxContainer" parent="UI/ToolBox/Panel/VBoxContainer/ScriptsPage" unique_id=1048291702]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_constants/separation = 4
+
+[node name="HintLabel" type="Label" parent="UI/ToolBox/Panel/VBoxContainer/ScriptsPage" unique_id=1048291703]
+layout_mode = 2
+text = "Press  S  to open the script editor.
+Click a script, then click a machine to attach.  RMB on a machine = detach."
+autowrap_mode = 3
+
+[node name="ScriptsScroll" type="ScrollContainer" parent="UI/ToolBox/Panel/VBoxContainer/ScriptsPage" unique_id=1048291704]
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+
+[node name="ScriptsList" type="VBoxContainer" parent="UI/ToolBox/Panel/VBoxContainer/ScriptsPage/ScriptsScroll" unique_id=1048291705]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_constants/separation = 2
