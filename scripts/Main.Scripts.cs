@@ -36,6 +36,9 @@ public partial class Main
 		ArmAddElbow,
 		ArmOpenClaw,
 		ArmCloseClaw,
+		// Track actions (available on any machine that can ride a track)
+		TrackSetPosition,
+		TrackAddPosition,
 	}
 
 	public sealed class ScriptBlock
@@ -161,7 +164,9 @@ public partial class Main
 		public float TargetShoulderAngle = -MathF.PI / 2f;
 		public float TargetElbowAngle    = -MathF.PI / 2f;
 		public bool  ClawClosed;
-		public bool  LaserOn = true;                      // turret-only; default firing
+		public bool  LaserOn    = true;
+		public float TrackT     = 0f;
+		public float TargetTrackT = 0f;
 		public ScriptRuntime Runtime;
 	}
 	private readonly ScriptPreview _preview = new();
@@ -278,12 +283,31 @@ public partial class Main
 	// ── Script-as-brush attach / detach ────────────────────────────────────────
 
 	// Returns the LaserTurret or RoboArm at simPos, preferring the one whose 5×3 / 3×3
-	// footprint contains the cell. Used by the script-attach brush.
+	// footprint contains the cell. Falls back to origin-based bounds for track-mounted
+	// machines (which have no grid cells in OccupiedIndices).
 	private object FindMachineAt(Vector2I simPos)
 	{
 		int idx = simPos.Y * SimW + simPos.X;
-		foreach (var t in _turrets) if (t.OccupiedIndices.Contains(idx)) return t;
-		foreach (var a in _arms)    if (a.OccupiedIndices.Contains(idx)) return a;
+		foreach (var t in _turrets)
+		{
+			if (t.OccupiedIndices.Contains(idx)) return t;
+			if (t.Track != null &&
+				simPos.X >= t.Origin.X - LaserTurret.BaseHalfW &&
+				simPos.X <= t.Origin.X + LaserTurret.BaseHalfW &&
+				simPos.Y >= t.Origin.Y &&
+				simPos.Y <  t.Origin.Y + LaserTurret.BaseH)
+				return t;
+		}
+		foreach (var a in _arms)
+		{
+			if (a.OccupiedIndices.Contains(idx)) return a;
+			if (a.Track != null &&
+				simPos.X >= a.Origin.X - RoboArm.BaseHalfW &&
+				simPos.X <= a.Origin.X + RoboArm.BaseHalfW &&
+				simPos.Y >= a.Origin.Y - RoboArm.BaseHalfW &&
+				simPos.Y <= a.Origin.Y + RoboArm.BaseHalfW)
+				return a;
+		}
 		return null;
 	}
 
@@ -441,6 +465,7 @@ public partial class Main
 			}
 			case BlockType.TurretLaserOn:  t.LaserOn = true;  break;
 			case BlockType.TurretLaserOff: t.LaserOn = false; break;
+			default: ExecuteTrackBlock(t.Track, ref t.TrackT, ref t.TargetTrackT, t.ScriptRT, b); break;
 		}
 	}
 
@@ -478,6 +503,31 @@ public partial class Main
 				break;
 			case BlockType.ArmCloseClaw:
 				if (!a.ClawClosed) ToggleArmClaw(a);
+				break;
+			default: ExecuteTrackBlock(a.Track, ref a.TrackT, ref a.TargetTrackT, a.ScriptRT, b); break;
+		}
+	}
+
+	private static int TrackMotionTicks(float current, float target)
+	{
+		float dist = MathF.Abs(target - current);
+		return TrackSmoothingSpeed <= 0f ? 0 : (int)MathF.Ceiling(dist / TrackSmoothingSpeed);
+	}
+
+	private static void ExecuteTrackBlock(RailTrack track, ref float trackT, ref float targetTrackT,
+		ScriptRuntime rt, ScriptBlock b)
+	{
+		switch (b.Type)
+		{
+			case BlockType.TrackSetPosition:
+			{
+				float newTarget = Math.Clamp(b.ValueF, 0f, 1f);
+				if (rt != null) rt.WaitRemaining = TrackMotionTicks(trackT, newTarget);
+				targetTrackT = newTarget;
+				break;
+			}
+			case BlockType.TrackAddPosition:
+				targetTrackT = Math.Clamp(targetTrackT + b.ValueF, 0f, 1f);
 				break;
 		}
 	}
@@ -759,6 +809,9 @@ public partial class Main
 			yield return BlockType.ArmOpenClaw;
 			yield return BlockType.ArmCloseClaw;
 		}
+		// Track blocks are available to all machine types
+		yield return BlockType.TrackSetPosition;
+		yield return BlockType.TrackAddPosition;
 	}
 
 	private static string BlockLabel(BlockType t) => t switch
@@ -774,9 +827,11 @@ public partial class Main
 		BlockType.ArmSetElbow     => "Set elbow (°)",
 		BlockType.ArmAddShoulder  => "Add to shoulder (°)",
 		BlockType.ArmAddElbow     => "Add to elbow (°)",
-		BlockType.ArmOpenClaw     => "Open claw",
-		BlockType.ArmCloseClaw    => "Close claw",
-		_                         => "?",
+		BlockType.ArmOpenClaw        => "Open claw",
+		BlockType.ArmCloseClaw       => "Close claw",
+		BlockType.TrackSetPosition   => "Track: set pos (0-1)",
+		BlockType.TrackAddPosition   => "Track: add pos (0-1)",
+		_                            => "?",
 	};
 
 	private void RefreshEditorPalette()
@@ -826,6 +881,8 @@ public partial class Main
 		_preview.TargetElbowAngle    = -MathF.PI / 2f;
 		_preview.ClawClosed          = false;
 		_preview.LaserOn             = true;
+		_preview.TrackT              = 0f;
+		_preview.TargetTrackT        = 0f;
 		_preview.Runtime             = null;
 		_previewCanvas?.QueueRedraw();
 	}
@@ -903,6 +960,18 @@ public partial class Main
 			spin.ValueChanged += v => { block.ValueF = (float)v; AutoSaveScripts(); ResetPreviewRuntime(); };
 			row.AddChild(spin);
 		}
+		else if (block.Type == BlockType.TrackSetPosition)
+		{
+			var spin = new SpinBox { MinValue = 0.0, MaxValue = 1.0, Step = 0.01, Value = block.ValueF };
+			spin.ValueChanged += v => { block.ValueF = (float)v; AutoSaveScripts(); ResetPreviewRuntime(); };
+			row.AddChild(spin);
+		}
+		else if (block.Type == BlockType.TrackAddPosition)
+		{
+			var spin = new SpinBox { MinValue = -1.0, MaxValue = 1.0, Step = 0.01, Value = block.ValueF };
+			spin.ValueChanged += v => { block.ValueF = (float)v; AutoSaveScripts(); ResetPreviewRuntime(); };
+			row.AddChild(spin);
+		}
 
 		// Loop-only: "enter scope" button
 		if (isLoop)
@@ -976,10 +1045,11 @@ public partial class Main
 
 		TickRuntime(_preview.Runtime, _scriptTicksThisFrame, ExecutePreviewBlock);
 
-		// Smooth current angles toward target angles at the global rate
 		float maxDelta = Mathf.DegToRad(ScriptSmoothingSpeed * _scriptTicksThisFrame);
 		_preview.ShoulderAngle = MoveAngleToward(_preview.ShoulderAngle, _preview.TargetShoulderAngle, maxDelta);
 		_preview.ElbowAngle    = MoveAngleToward(_preview.ElbowAngle,    _preview.TargetElbowAngle,    maxDelta);
+		_preview.TrackT        = Math.Clamp(MoveAngleToward(_preview.TrackT, _preview.TargetTrackT,
+		                             TrackSmoothingSpeed * _scriptTicksThisFrame), 0f, 1f);
 
 		_previewCanvas?.QueueRedraw();
 	}
@@ -1015,10 +1085,54 @@ public partial class Main
 			case BlockType.ArmCloseClaw:    _preview.ClawClosed = true;  break;
 			case BlockType.TurretLaserOn:   _preview.LaserOn    = true;  break;
 			case BlockType.TurretLaserOff:  _preview.LaserOn    = false; break;
+			case BlockType.TrackSetPosition:
+			{
+				float newTarget = Math.Clamp(b.ValueF, 0f, 1f);
+				if (_preview.Runtime != null)
+					_preview.Runtime.WaitRemaining = TrackMotionTicks(_preview.TrackT, newTarget);
+				_preview.TargetTrackT = newTarget;
+				break;
+			}
+			case BlockType.TrackAddPosition:
+				_preview.TargetTrackT = Math.Clamp(_preview.TargetTrackT + b.ValueF, 0f, 1f);
+				break;
 		}
 	}
 
-	private const float PreviewScale = 3f; // pixels per sim-cell in the preview window
+	private const float PreviewScale  = 3f;
+	private const float TrackMarginPx = 20f; // screen-px inset from canvas edges for the preview track
+
+	private static bool ScriptHasTrackBlocks(MachineScript script) =>
+		BlockListHasTrack(script.Blocks);
+
+	private static bool BlockListHasTrack(List<ScriptBlock> blocks)
+	{
+		foreach (var b in blocks)
+		{
+			if (b.Type == BlockType.TrackSetPosition || b.Type == BlockType.TrackAddPosition) return true;
+			if (b.Body != null && BlockListHasTrack(b.Body)) return true;
+		}
+		return false;
+	}
+
+	private static void DrawPreviewTrack(OverlayCanvas c, float left, float right, float y)
+	{
+		var bedCol  = new Color(0.22f, 0.22f, 0.25f);
+		var tieCol  = new Color(0.35f, 0.25f, 0.15f);
+		var railCol = new Color(0.78f, 0.78f, 0.82f);
+
+		c.DrawLine(new Vector2(left, y), new Vector2(right, y), bedCol, 7f);
+
+		float tieInterval = 14f;
+		for (float x = left; x <= right + 0.5f; x += tieInterval)
+			c.DrawLine(new Vector2(x, y - 5f), new Vector2(x, y + 5f), tieCol, 4f);
+
+		c.DrawLine(new Vector2(left, y - 4f), new Vector2(right, y - 4f), railCol, 2.5f);
+		c.DrawLine(new Vector2(left, y + 4f), new Vector2(right, y + 4f), railCol, 2.5f);
+
+		c.DrawCircle(new Vector2(left,  y), 4.5f, railCol);
+		c.DrawCircle(new Vector2(right, y), 4.5f, railCol);
+	}
 
 	private void DrawPreview(OverlayCanvas c)
 	{
@@ -1035,8 +1149,16 @@ public partial class Main
 
 	private void DrawPreviewTurret(OverlayCanvas c, Vector2 canvasSize)
 	{
-		Vector2 center = new Vector2(canvasSize.X / 2f, canvasSize.Y / 2f);
 		float   s      = PreviewScale;
+		bool    onTrack = _editingScript != null && ScriptHasTrackBlocks(_editingScript);
+		float   trackY = canvasSize.Y / 2f;
+		float   trackL = TrackMarginPx, trackR = canvasSize.X - TrackMarginPx;
+
+		if (onTrack) DrawPreviewTrack(c, trackL, trackR, trackY);
+
+		Vector2 center = onTrack
+			? new Vector2(Mathf.Lerp(trackL, trackR, _preview.TrackT), trackY)
+			: new Vector2(canvasSize.X / 2f, canvasSize.Y / 2f);
 
 		// 5×3 stone base centred on (Origin.X, Origin.Y+1) — turret pivot is at +1 row
 		var stoneCol  = new Color(0.45f, 0.45f, 0.50f);
@@ -1066,9 +1188,16 @@ public partial class Main
 
 	private void DrawPreviewArm(OverlayCanvas c, Vector2 canvasSize)
 	{
-		// Anchor the base in the lower-middle so the arm has room to swing upward
-		Vector2 baseCenter = new Vector2(canvasSize.X / 2f, canvasSize.Y - 30);
-		float   s          = PreviewScale;
+		float   s       = PreviewScale;
+		bool    onTrack = _editingScript != null && ScriptHasTrackBlocks(_editingScript);
+		float   baseY   = canvasSize.Y - 30;
+		float   trackL  = TrackMarginPx, trackR = canvasSize.X - TrackMarginPx;
+
+		if (onTrack) DrawPreviewTrack(c, trackL, trackR, baseY);
+
+		Vector2 baseCenter = onTrack
+			? new Vector2(Mathf.Lerp(trackL, trackR, _preview.TrackT), baseY)
+			: new Vector2(canvasSize.X / 2f, baseY);
 
 		var stoneCol  = new Color(0.45f, 0.45f, 0.50f);
 		var copperCol = new Color(0.86f, 0.48f, 0.18f);

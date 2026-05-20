@@ -19,7 +19,7 @@ public partial class Main
 		BrushSand, BrushWater, BrushStone, BrushLava, BrushGas, BrushFood,
 		BrushCopper, BrushBattery, BrushWood, BrushErase, BrushForce,
 		BrushDirt, BrushGrassSeed, BrushTreeSeed, BrushFire, BrushLiquidNitrogen,
-		BrushGlorp, BrushTurret, BrushMirror, BrushArm,
+		BrushGlorp, BrushTurret, BrushMirror, BrushArm, BrushTrack,
 	};
 
 	// ── Data ──────────────────────────────────────────────────────────────────

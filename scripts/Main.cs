@@ -32,6 +32,7 @@ public partial class Main : Control
 	private const int BrushFire           = -9;
 	private const int BrushLiquidNitrogen = (int)Simulation.Cell.LiquidNitrogen;
 	private const int BrushArm            = -10;
+	private const int BrushTrack          = -12;
 
 	// ── Colours ───────────────────────────────────────────────────────────────
 
@@ -162,6 +163,12 @@ public partial class Main : Control
 	private readonly List<BezierMirror> _mirrors = new();
 	private BezierMirror _mirrorInProgress;
 
+	// Rail tracks
+	private readonly List<RailTrack> _tracks = new();
+	private RailTrack _trackInProgress;
+	private Button    _btnTrack;
+	private object    _trackDragMachine; // LaserTurret or RoboArm being dragged along a track
+
 	// Wire overlay system
 	private readonly List<WireNode> _wireNodes     = new();
 	private int     _wirePendingIdx = -1;    // first-click node awaiting second click; -1 = none
@@ -254,6 +261,7 @@ public partial class Main : Control
 		_btnFire            = GetNode<Button>(g + "BtnFire");
 		_btnLiquidNitrogen  = GetNode<Button>(g + "BtnLiquidNitrogen");
 		_btnArm             = GetNode<Button>(g + "BtnArm");
+		_btnTrack           = GetNode<Button>(g + "BtnTrack");
 
 		_slider      = GetNode<HSlider>("UI/ToolBox/Panel/VBoxContainer/MaterialsPage/SizeSlider");
 		_speedSlider = GetNode<HSlider>("UI/ToolBox/Panel/VBoxContainer/SettingsPage/SpeedSlider");
@@ -294,6 +302,7 @@ public partial class Main : Control
 		_btnFire.Pressed           += () => SetBrush(BrushFire);
 		_btnLiquidNitrogen.Pressed += () => SetBrush(BrushLiquidNitrogen);
 		_btnArm.Pressed            += () => SetBrush(BrushArm);
+		_btnTrack.Pressed          += () => SetBrush(BrushTrack);
 		_slider.ValueChanged      += v => _brushSize      = (int)v;
 		_speedSlider.ValueChanged += v => _ticksPerSecond = (int)v;
 
@@ -357,6 +366,7 @@ public partial class Main : Control
 		// Wire power runs after the last sim tick so it writes into Electric[] after
 		// PropagateElectricity has built the copper network for this frame.
 		PropagateWirePower();
+		UpdateTracks();
 		UpdateMachineSpaceTarget();
 		UpdateTurrets();
 		UpdateArms();
@@ -388,6 +398,13 @@ public partial class Main : Control
 		bool lmbHeld = Input.IsMouseButtonPressed(MouseButton.Left);
 		bool rmbHeld = Input.IsMouseButtonPressed(MouseButton.Right);
 
+		// Track machine drag overrides all brush behavior while held
+		if (lmbHeld && _trackDragMachine != null)
+		{
+			UpdateTrackMachineDrag(ScreenToSimF(mouse));
+			return;
+		}
+
 		// Arm joint drag overrides all brush behavior while held
 		if (lmbHeld && _armDrag != null)
 		{
@@ -418,6 +435,9 @@ public partial class Main : Control
 				case BrushMirror:
 					_mirrorInProgress?.AddSample(ScreenToSimF(mouse));
 					break;
+				case BrushTrack:
+					_trackInProgress?.AddSample(ScreenToSimF(mouse));
+					break;
 				default:
 					ApplyBrush(mouse);
 					break;
@@ -439,6 +459,7 @@ public partial class Main : Control
 				EraseArmsInRadius(simPos.X, simPos.Y, _brushSize);
 			}
 		}
+		// Track detach/delete is handled as a one-shot on RMB press (see _Input)
 	}
 
 	// ── Input ─────────────────────────────────────────────────────────────────
@@ -562,6 +583,18 @@ public partial class Main : Control
 
 				if (mb.ButtonIndex == MouseButton.Left)
 				{
+					// Track machine drag — skip when BrushScript is active so script-attach clicks reach their handler
+					if (!overUI && _brush != BrushScript)
+					{
+						var trackMach = FindNearestTrackMachine(ScreenToSimF(mouse));
+						if (trackMach != null)
+						{
+							_trackDragMachine = trackMach;
+							GetViewport().SetInputAsHandled();
+							return;
+						}
+					}
+
 					// Arm-joint drag takes priority over every brush — clicking near
 					// any elbow or claw grabs that joint regardless of current tool.
 					if (!overUI)
@@ -596,11 +629,22 @@ public partial class Main : Control
 					}
 					else if (_brush == BrushTurret && !overUI)
 					{
-						PlaceTurret(ScreenToSim(mouse));
+						var simF = ScreenToSimF(mouse);
+						var snap = FindNearestTrackSnap(simF);
+						if (snap.HasValue) PlaceTrackTurret(snap.Value.track, snap.Value.t);
+						else              PlaceTurret(ScreenToSim(mouse));
 					}
 					else if (_brush == BrushArm && !overUI)
 					{
-						PlaceArm(ScreenToSim(mouse));
+						var simF = ScreenToSimF(mouse);
+						var snap = FindNearestTrackSnap(simF);
+						if (snap.HasValue) PlaceTrackArm(snap.Value.track, snap.Value.t);
+						else              PlaceArm(ScreenToSim(mouse));
+					}
+					else if (_brush == BrushTrack && !overUI)
+					{
+						_trackInProgress = new RailTrack();
+						_trackInProgress.AddSample(ScreenToSimF(mouse));
 					}
 					else if (_brush == BrushScript && !overUI)
 					{
@@ -616,8 +660,19 @@ public partial class Main : Control
 				{
 					var rMouse = mb.Position / Scale;
 					var hit = FindGlorpAt(rMouse);
-					if (hit != null) { SelectGlorp(hit); _suppressRightErase = true; }
-					else             { _suppressRightErase = false; }
+					if (hit != null)
+					{
+						SelectGlorp(hit);
+						_suppressRightErase = true;
+					}
+					else if (!overUI && _brush != BrushScript && TryTrackRmb(ScreenToSimF(mb.Position)))
+					{
+						_suppressRightErase = true;
+					}
+					else
+					{
+						_suppressRightErase = false;
+					}
 				}
 				else if (mb.ButtonIndex == MouseButton.WheelUp)
 				{ _brushSize = Math.Min(_brushSize + 1, 20); _slider.Value = _brushSize; }
@@ -636,7 +691,11 @@ public partial class Main : Control
 
 				if (mb.ButtonIndex == MouseButton.Left)
 				{
-					if (_armDrag != null)
+					if (_trackDragMachine != null)
+					{
+						_trackDragMachine = null;
+					}
+					else if (_armDrag != null)
 					{
 						_armDrag = null;
 					}
@@ -644,6 +703,12 @@ public partial class Main : Control
 					{
 						_selectingHeat = false;
 						_hasHeatResult = true;
+					}
+					else if (_trackInProgress != null)
+					{
+						if (_trackInProgress.SamplePoints.Count >= 2)
+							_tracks.Add(_trackInProgress);
+						_trackInProgress = null;
 					}
 					else if (_mirrorInProgress != null)
 					{
@@ -878,6 +943,7 @@ public partial class Main : Control
 		foreach (var m in _mirrors)
 			m.Draw(c, mirrorCol);
 		_mirrorInProgress?.Draw(c, mirrorColWip);
+		DrawTracks(c);
 		DrawTurrets(c);
 		DrawArms(c);
 		// Wire overlay — only visible while wire mode is active (Z to toggle)
@@ -995,6 +1061,11 @@ public partial class Main : Control
 			if (_mirrorInProgress.SamplePoints.Count >= 2) _mirrors.Add(_mirrorInProgress);
 			_mirrorInProgress = null;
 		}
+		if (b != BrushTrack && _trackInProgress != null)
+		{
+			if (_trackInProgress.SamplePoints.Count >= 2) _tracks.Add(_trackInProgress);
+			_trackInProgress = null;
+		}
 		_brush = b;
 		// Clear any heat selection when switching away
 		if (b != BrushHeatView) { _selectingHeat = false; _hasHeatResult = false; }
@@ -1021,6 +1092,7 @@ public partial class Main : Control
 		_btnFire.Modulate           = b == BrushFire           ? Colors.Yellow : Colors.White;
 		_btnLiquidNitrogen.Modulate = b == BrushLiquidNitrogen ? Colors.Yellow : Colors.White;
 		_btnArm.Modulate            = b == BrushArm            ? Colors.Yellow : Colors.White;
+		_btnTrack.Modulate          = b == BrushTrack          ? Colors.Yellow : Colors.White;
 	}
 
 	private void SetActiveTab(int tab)
@@ -1214,6 +1286,7 @@ public partial class Main : Control
 				_glorps.Clear(); _selectedGlorp = null;
 				_turrets.Clear();
 				_mirrors.Clear(); _mirrorInProgress = null;
+				_tracks.Clear();  _trackInProgress  = null; _trackDragMachine = null;
 				_arms.Clear(); _activeArm = null; _armDrag = null;
 				_sim.RenderDirty = true;
 				ConsoleLog("[color=cyan]Grid cleared.[/color]");
@@ -1339,7 +1412,20 @@ public partial class Main : Control
 		float maxDelta = Mathf.DegToRad(ScriptSmoothingSpeed * _scriptTicksThisFrame);
 		foreach (var t in _turrets)
 		{
-			t.Powered = t.CheckPowered(_sim);
+			t.Powered = t.Track != null ? t.Track.Powered : t.CheckPowered(_sim);
+
+			// Slide along track
+			if (t.Track != null)
+			{
+				if (t.ScriptRT != null)
+					t.TrackT = MoveAngleToward(t.TrackT, t.TargetTrackT, TrackSmoothingSpeed * _scriptTicksThisFrame);
+				else
+					t.TrackT = t.TargetTrackT; // manual drag: instant
+				t.TrackT = Math.Clamp(t.TrackT, 0f, 1f);
+				var pos = t.Track.GetPointAtT(t.TrackT);
+				t.Origin = new Vector2I((int)pos.X, (int)pos.Y);
+				_sim.RenderDirty = true;
+			}
 			if (t.ScriptRT != null)
 			{
 				// Scripted: advance runtime; manual aim is disabled while a script is attached
@@ -1471,7 +1557,20 @@ public partial class Main : Control
 		float maxDelta = Mathf.DegToRad(ScriptSmoothingSpeed * _scriptTicksThisFrame);
 		foreach (var a in _arms)
 		{
-			a.Powered = a.CheckPowered(_sim);
+			a.Powered = a.Track != null ? a.Track.Powered : a.CheckPowered(_sim);
+
+			// Slide along track
+			if (a.Track != null)
+			{
+				if (a.ScriptRT != null)
+					a.TrackT = MoveAngleToward(a.TrackT, a.TargetTrackT, TrackSmoothingSpeed * _scriptTicksThisFrame);
+				else
+					a.TrackT = a.TargetTrackT;
+				a.TrackT = Math.Clamp(a.TrackT, 0f, 1f);
+				var pos = a.Track.GetPointAtT(a.TrackT);
+				a.Origin = new Vector2I((int)pos.X, (int)pos.Y);
+				_sim.RenderDirty = true;
+			}
 			if (a.ScriptRT != null)
 			{
 				if (a.Powered)
@@ -1498,9 +1597,19 @@ public partial class Main : Control
 
 	private void DrawArms(OverlayCanvas c)
 	{
+		var trackArmBaseCol = new Color(0.45f, 0.45f, 0.50f, 0.85f);
 		Span<Vector2I> pincer = stackalloc Vector2I[RoboArm.PincerCellCount(RoboArm.MaxPincerHalfWidth, RoboArm.MaxPincerDepth)];
 		foreach (var a in _arms)
 		{
+			// Draw overlay base for track-mounted arms (no grid cells)
+			if (a.Track != null)
+			{
+				float bx = (a.Origin.X - RoboArm.BaseHalfW) * Scale;
+				float by = (a.Origin.Y - RoboArm.BaseHalfW) * Scale;
+				int   bw = (RoboArm.BaseHalfW * 2 + 1) * Scale;
+				c.DrawRect(new Rect2(bx, by, bw, bw), trackArmBaseCol, filled: true);
+			}
+
 			float alpha = a.Powered ? 1.0f : 0.5f;
 			var bodyCol  = new Color(0.62f, 0.66f, 0.72f, alpha);
 			var jointCol = new Color(0.80f, 0.85f, 0.90f, alpha);
@@ -1568,8 +1677,21 @@ public partial class Main : Control
 		const float barrelPx = 4 * Scale;
 		var barrelCol = new Color(0.12f, 0.12f, 0.12f);
 
+		var trackBaseCol = new Color(0.45f, 0.45f, 0.50f, 0.85f); // stone gray for track-mounted base
 		foreach (var t in _turrets)
 		{
+			// Draw overlay base for track-mounted turrets (no grid cells)
+			if (t.Track != null)
+			{
+				float bx = (t.Origin.X - LaserTurret.BaseHalfW) * Scale;
+				float by =  t.Origin.Y                           * Scale;
+				c.DrawRect(new Rect2(bx, by, (LaserTurret.BaseHalfW * 2 + 1) * Scale, LaserTurret.BaseH * Scale),
+					trackBaseCol, filled: true);
+				// Battery dot at center-top
+				c.DrawRect(new Rect2(t.Origin.X * Scale, t.Origin.Y * Scale, Scale, Scale),
+					new Color(0.50f, 0.52f, 0.58f, 1f), filled: true);
+			}
+
 			var pivotScr = new Vector2(t.Origin.X * Scale + Scale * 0.5f,
 									   t.Origin.Y * Scale + Scale * 0.5f);
 			var dir     = new Vector2(MathF.Cos(t.Angle), MathF.Sin(t.Angle));
@@ -1687,16 +1809,21 @@ public partial class Main : Control
 	{
 		public Vector2            Pos;                         // sim-space float position
 		public readonly List<int> Connections = new();        // indices into _wireNodes (undirected)
-		public int                AnchorIdx   = -1;           // grid cell if snapped to battery/terminal; -1 if free junction
+		public int                AnchorIdx   = -1;           // grid cell if snapped to battery/terminal; -1 if free or track terminal
 		public bool               Powered;                    // set by PropagateWirePower each frame
+		public RailTrack          TrackRef;                   // non-null if this node is anchored to a track endpoint
+		public bool               TrackIsStart;               // true = t=0 endpoint, false = t=1 endpoint
 	}
 
 	// Returns the snapped sim position for a cursor. Preference order by distance:
-	// battery cells → machine terminals → existing wire nodes → cursor unchanged.
-	private Vector2 FindWireSnap(Vector2 simPos, out int anchorIdx, out int existingNodeIdx)
+	// battery cells → machine terminals → track endpoints → existing wire nodes → cursor unchanged.
+	private Vector2 FindWireSnap(Vector2 simPos, out int anchorIdx, out int existingNodeIdx,
+		out RailTrack trackRef, out bool trackIsStart)
 	{
 		anchorIdx      = -1;
 		existingNodeIdx = -1;
+		trackRef       = null;
+		trackIsStart   = false;
 		float   best    = _wireSnapRadius;
 		Vector2 snapPos = simPos;
 
@@ -1756,6 +1883,25 @@ public partial class Main : Control
 			}
 		}
 
+		// Track endpoints
+		foreach (var tr in _tracks)
+		{
+			foreach (bool isStart in new[] { true, false })
+			{
+				var ep   = isStart ? tr.StartPoint : tr.EndPoint;
+				float dist = simPos.DistanceTo(ep);
+				if (dist < best)
+				{
+					best           = dist;
+					snapPos        = ep;
+					anchorIdx      = -1;
+					existingNodeIdx = -1;
+					trackRef       = tr;
+					trackIsStart   = isStart;
+				}
+			}
+		}
+
 		// Existing wire nodes (don't snap a pending node to itself)
 		for (int i = 0; i < _wireNodes.Count; i++)
 		{
@@ -1767,6 +1913,8 @@ public partial class Main : Control
 				snapPos        = _wireNodes[i].Pos;
 				anchorIdx      = _wireNodes[i].AnchorIdx;
 				existingNodeIdx = i;
+				trackRef       = _wireNodes[i].TrackRef;
+				trackIsStart   = _wireNodes[i].TrackIsStart;
 			}
 		}
 
@@ -1776,7 +1924,7 @@ public partial class Main : Control
 	// LMB click in wire mode: place or reuse a node and connect it to the pending node.
 	private void PlaceWireClick(Vector2 simPos)
 	{
-		var snapPos = FindWireSnap(simPos, out int anchorIdx, out int existingIdx);
+		var snapPos = FindWireSnap(simPos, out int anchorIdx, out int existingIdx, out RailTrack snapTrackRef, out bool snapTrackIsStart);
 
 		int targetIdx;
 		if (existingIdx >= 0)
@@ -1786,7 +1934,7 @@ public partial class Main : Control
 		}
 		else
 		{
-			_wireNodes.Add(new WireNode { Pos = snapPos, AnchorIdx = anchorIdx });
+			_wireNodes.Add(new WireNode { Pos = snapPos, AnchorIdx = anchorIdx, TrackRef = snapTrackRef, TrackIsStart = snapTrackIsStart });
 			targetIdx = _wireNodes.Count - 1;
 		}
 
@@ -1841,6 +1989,7 @@ public partial class Main : Control
 		if (_wireNodes.Count == 0) return;
 
 		foreach (var n in _wireNodes) n.Powered = false;
+		foreach (var tr in _tracks)  tr.Powered = false;
 
 		var queue = new Queue<int>();
 		for (int i = 0; i < _wireNodes.Count; i++)
@@ -1859,12 +2008,14 @@ public partial class Main : Control
 			}
 		}
 
-		// Deliver power to machine terminals via the existing Electric[] channel
+		// Deliver power to machine terminals via Electric[] channel, and to tracks via TrackRef
 		foreach (var n in _wireNodes)
 		{
-			if (n.Powered && n.AnchorIdx >= 0
-				&& _sim.Grid[n.AnchorIdx] != (byte)Simulation.Cell.Battery)
+			if (!n.Powered) continue;
+			if (n.AnchorIdx >= 0 && _sim.Grid[n.AnchorIdx] != (byte)Simulation.Cell.Battery)
 				_sim.Electric[n.AnchorIdx] = 1;
+			if (n.TrackRef != null)
+				n.TrackRef.Powered = true;
 		}
 	}
 
@@ -1910,7 +2061,7 @@ public partial class Main : Control
 		// Ghost wire + snap indicator when a pending node is waiting for second click
 		if (_wirePendingIdx >= 0 && _wirePendingIdx < _wireNodes.Count)
 		{
-			var snapPos = FindWireSnap(_mouseSimF, out _, out _);
+			var snapPos = FindWireSnap(_mouseSimF, out _, out _, out _, out _);
 			Vector2 from = _wireNodes[_wirePendingIdx].Pos * Scale;
 			Vector2 to   = snapPos * Scale;
 			c.DrawLine(from, to, ghostCol, 1.5f);
@@ -1919,8 +2070,8 @@ public partial class Main : Control
 		else
 		{
 			// No pending node: show a subtle snap indicator at cursor position
-			var snapPos = FindWireSnap(_mouseSimF, out int snapAnchor, out _);
-			bool snapped = snapAnchor >= 0 || snapPos.DistanceTo(_mouseSimF) > 0.1f;
+			var snapPos = FindWireSnap(_mouseSimF, out int snapAnchor, out _, out RailTrack snapTr, out _);
+			bool snapped = snapAnchor >= 0 || snapTr != null || snapPos.DistanceTo(_mouseSimF) > 0.1f;
 			if (snapped)
 			{
 				var snapIndicatorCol = new Color(0.40f, 0.85f, 1.00f, 0.60f);
@@ -1947,6 +2098,9 @@ public partial class Main : Control
 		public bool               Frozen;                         // Space-toggled: stops mouse-aim, keeps firing. Scripted turrets ignore Frozen.
 		public ScriptRuntime      ScriptRT;                       // null = manual (mouse-aim); non-null = scripted
 		public readonly List<int> OccupiedIndices = new();
+		public RailTrack          Track;                          // null = free-standing; non-null = riding a track
+		public float              TrackT;                         // current position on track (0=start, 1=end)
+		public float              TargetTrackT;                   // scripted/drag target position
 
 		public static LaserTurret Place(Simulation sim, Vector2I origin)
 		{
@@ -2036,6 +2190,9 @@ public partial class Main : Control
 		public ScriptRuntime ScriptRT;                              // null = manual (joint drag); non-null = scripted
 		public readonly List<(byte cell, byte flow)> Held = new();
 		public readonly List<int> OccupiedIndices = new();
+		public RailTrack Track;
+		public float     TrackT;
+		public float     TargetTrackT;
 
 		public Vector2 Shoulder => new(Origin.X + 0.5f, Origin.Y + 0.5f);
 		public Vector2 Elbow    => Shoulder + new Vector2(MathF.Cos(ShoulderAngle), MathF.Sin(ShoulderAngle)) * UpperArmLen;
